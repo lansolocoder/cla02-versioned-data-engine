@@ -1,0 +1,11 @@
+[package]
+name = "versioned-data-engine"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+publish = false
+
+[dependencies]
+axum = { version = "=0.8.9", default-features = false, features = ["http1", "json", "tokio"] }
+serde = { version = "=1.0.229", features = ["derive"] }
+tokio = { version = "=1.53.1", features = ["macros", "net", "rt-multi-thread", "signal"] }
