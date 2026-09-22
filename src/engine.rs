@@ -232,7 +232,10 @@ fn parse_change(value: &Value, path: &str) -> Result<Change, ApiError> {
         .and_then(Value::as_str)
         .ok_or_else(|| ApiError::bad_request("change id must be a string", &id_path))?;
     if id.is_empty() {
-        return Err(ApiError::bad_request("change id must be non-empty", &id_path));
+        return Err(ApiError::bad_request(
+            "change id must be non-empty",
+            &id_path,
+        ));
     }
 
     let op_path = format!("{path}/op");
@@ -387,12 +390,230 @@ fn json_eq(a: &Value, b: &Value) -> bool {
     }
 }
 
+/// 无损十进制数字相等：按数学值比较任意合法 JSON 数字，全程不经过 f64。
+/// 数字文本由 serde_json 的 `arbitrary_precision` 原样保留，
+/// 因此整数、小数、任意大小的正负指数写法都能精确解析与比较。
 fn number_eq(a: &Number, b: &Number) -> bool {
-    if a.is_f64() || b.is_f64() {
-        a.as_f64() == b.as_f64()
+    match (Decimal::parse(a.as_str()), Decimal::parse(b.as_str())) {
+        (Some(x), Some(y)) => x == y,
+        // 解析器已保证 Number 文本是合法 JSON 数字，此处仅作防御性兜底。
+        _ => a == b,
+    }
+}
+
+/// 规范化后的十进制值：符号 + 有效数字 + 精确的十进制幂。
+/// 例如 1、1.0、1e0、100e-2 均归一为 `1 × 10^0`；零（含 -0）统一为非负 0。
+#[derive(Debug, PartialEq, Eq)]
+struct Decimal {
+    non_negative: bool,
+    digits: String,
+    power: BigInt,
+}
+
+impl Decimal {
+    /// 解析语法合法的 JSON 数字文本为规范化十进制值；非法文本返回 None。
+    fn parse(text: &str) -> Option<Decimal> {
+        let bytes = text.as_bytes();
+        let mut pos = 0usize;
+        let mut non_negative = true;
+        if bytes.first() == Some(&b'-') {
+            non_negative = false;
+            pos += 1;
+        }
+
+        // 尾数：收集全部数字并记录小数位数。
+        let mut mantissa = String::new();
+        let mut frac_len: u64 = 0;
+        let mut seen_dot = false;
+        while let Some(&c) = bytes.get(pos) {
+            match c {
+                b'0'..=b'9' => {
+                    mantissa.push(c as char);
+                    pos += 1;
+                    if seen_dot {
+                        frac_len += 1;
+                    }
+                }
+                b'.' if !seen_dot => {
+                    seen_dot = true;
+                    pos += 1;
+                }
+                _ => break,
+            }
+        }
+        if mantissa.is_empty() {
+            return None;
+        }
+
+        // 指数部分（可选）：用任意精度有符号整数保存，容纳超大指数。
+        let mut exponent = BigInt::zero();
+        if pos < bytes.len() {
+            if bytes[pos] != b'e' && bytes[pos] != b'E' {
+                return None;
+            }
+            pos += 1;
+            let mut exp_negative = false;
+            if let Some(&sign) = bytes.get(pos) {
+                match sign {
+                    b'+' => pos += 1,
+                    b'-' => {
+                        exp_negative = true;
+                        pos += 1;
+                    }
+                    _ => {}
+                }
+            }
+            let start = pos;
+            while matches!(bytes.get(pos), Some(b'0'..=b'9')) {
+                pos += 1;
+            }
+            if pos == start || pos != bytes.len() {
+                return None;
+            }
+            exponent = BigInt::from_digits(&text[start..pos], !exp_negative);
+        }
+
+        // 去掉有效数字之外的前导零与尾随零。
+        let first = mantissa.find(|c: char| c != '0');
+        let (first, last) = match first {
+            Some(first) => (first, mantissa.rfind(|c: char| c != '0').unwrap()),
+            None => return Some(Self::zero()),
+        };
+        let digits = mantissa[first..=last].to_owned();
+        let trailing_zeros: u64 = (mantissa.len() - 1 - last) as u64;
+        let power = exponent
+            .sub(&BigInt::from_u64(frac_len))
+            .add(&BigInt::from_u64(trailing_zeros));
+        Some(Decimal {
+            non_negative,
+            digits,
+            power,
+        })
+    }
+
+    fn zero() -> Self {
+        Decimal {
+            non_negative: true,
+            digits: "0".to_owned(),
+            power: BigInt::zero(),
+        }
+    }
+}
+
+/// 仅依赖标准库的任意精度十进制有符号整数，数字按高位在前存储、无前导零。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BigInt {
+    non_negative: bool,
+    digits: String,
+}
+
+impl BigInt {
+    fn zero() -> Self {
+        BigInt {
+            non_negative: true,
+            digits: "0".to_owned(),
+        }
+    }
+
+    fn from_u64(value: u64) -> Self {
+        Self::from_digits(&value.to_string(), true)
+    }
+
+    fn from_digits(digits: &str, non_negative: bool) -> Self {
+        let trimmed = digits.trim_start_matches('0');
+        if trimmed.is_empty() {
+            Self::zero()
+        } else {
+            BigInt {
+                non_negative,
+                digits: trimmed.to_owned(),
+            }
+        }
+    }
+
+    fn add(&self, other: &BigInt) -> BigInt {
+        if self.non_negative == other.non_negative {
+            BigInt::from_digits(&mag_add(&self.digits, &other.digits), self.non_negative)
+        } else {
+            match mag_cmp(&self.digits, &other.digits) {
+                std::cmp::Ordering::Equal => BigInt::zero(),
+                std::cmp::Ordering::Greater => {
+                    BigInt::from_digits(&mag_sub(&self.digits, &other.digits), self.non_negative)
+                }
+                std::cmp::Ordering::Less => {
+                    BigInt::from_digits(&mag_sub(&other.digits, &self.digits), other.non_negative)
+                }
+            }
+        }
+    }
+
+    fn sub(&self, other: &BigInt) -> BigInt {
+        if other.digits == "0" {
+            return self.clone();
+        }
+        self.add(&BigInt {
+            non_negative: !other.non_negative,
+            digits: other.digits.clone(),
+        })
+    }
+}
+
+/// 两个无符号十进制数字串的大小比较。
+fn mag_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    a.len().cmp(&b.len()).then_with(|| a.cmp(b))
+}
+
+/// 无符号十进制数字串相加（入参均无前导零）。
+fn mag_add(a: &str, b: &str) -> String {
+    let mut out = String::with_capacity(a.len().max(b.len()) + 1);
+    let (mut ai, mut bi) = (a.len(), b.len());
+    let mut carry = 0u8;
+    let a = a.as_bytes();
+    let b = b.as_bytes();
+    while ai > 0 || bi > 0 || carry > 0 {
+        let mut sum = carry;
+        if ai > 0 {
+            ai -= 1;
+            sum += a[ai] - b'0';
+        }
+        if bi > 0 {
+            bi -= 1;
+            sum += b[bi] - b'0';
+        }
+        out.push((b'0' + sum % 10) as char);
+        carry = sum / 10;
+    }
+    out.chars().rev().collect()
+}
+
+/// 无符号十进制数字串相减，要求 a ≥ b。
+fn mag_sub(a: &str, b: &str) -> String {
+    let mut out = String::with_capacity(a.len());
+    let (mut ai, mut bi) = (a.len(), b.len());
+    let mut borrow = 0i8;
+    let a = a.as_bytes();
+    let b = b.as_bytes();
+    while ai > 0 {
+        ai -= 1;
+        let mut digit = (a[ai] - b'0') as i8 - borrow;
+        if bi > 0 {
+            bi -= 1;
+            digit -= (b[bi] - b'0') as i8;
+        }
+        if digit < 0 {
+            digit += 10;
+            borrow = 1;
+        } else {
+            borrow = 0;
+        }
+        out.push((b'0' + digit as u8) as char);
+    }
+    let reversed: String = out.chars().rev().collect();
+    let trimmed = reversed.trim_start_matches('0');
+    if trimmed.is_empty() {
+        "0".to_owned()
     } else {
-        // 两侧均为整数时直接比较，避免浮点精度损失。
-        a == b
+        trimmed.to_owned()
     }
 }
 
@@ -641,7 +862,9 @@ fn apply_change(rows: &mut BTreeMap<String, Value>, change: &Change, reverse: bo
             }
         }
         Change::Update { id, fields } => {
-            let row = rows.get_mut(id).expect("row existence validated before apply");
+            let row = rows
+                .get_mut(id)
+                .expect("row existence validated before apply");
             for field in fields {
                 let segments =
                     parse_pointer(&field.path).expect("field path validated at parse time");
@@ -884,6 +1107,186 @@ mod tests {
             "changes": [{"id": "r", "op": "remove", "value": {"x": 2}}],
             "direction": "forward"
         }))
+        .unwrap_err();
+        assert_eq!(err.status, 409);
+        assert_eq!(err.path, "/changes/0/value");
+    }
+
+    // 解析保留原始数字写法的 JSON（json! 宏无法表达 i64 范围外的字面量）。
+    fn parse(text: &str) -> Value {
+        serde_json::from_str(text).expect("test JSON should be valid")
+    }
+
+    #[test]
+    fn decimal_canonicalizes_equal_number_forms() {
+        let forms = ["1", "1.0", "1.00", "1e0", "1E0", "1e+0", "100e-2", "10e-1"];
+        for a in forms {
+            for b in forms {
+                let x = Decimal::parse(a).unwrap();
+                let y = Decimal::parse(b).unwrap();
+                assert_eq!(x, y, "{a} 与 {b} 数学值应相等");
+            }
+        }
+        // 零的各种写法（含负零）统一为非负 0。
+        for z in ["0", "-0", "0.0", "-0.0", "0e0", "-0e10", "0.000e-5"] {
+            assert_eq!(Decimal::parse(z).unwrap(), Decimal::zero());
+        }
+    }
+
+    #[test]
+    fn decimal_distinguishes_close_large_and_small_values() {
+        // 2^53 边界：f64 会把两者舍入成同一个值。
+        assert_ne!(
+            Decimal::parse("9007199254740993").unwrap(),
+            Decimal::parse("9007199254740992.0").unwrap()
+        );
+        assert_eq!(
+            Decimal::parse("9007199254740992").unwrap(),
+            Decimal::parse("9007199254740992.0").unwrap()
+        );
+        // 符号差异。
+        assert_ne!(Decimal::parse("-1").unwrap(), Decimal::parse("1").unwrap());
+        assert_ne!(
+            Decimal::parse("1.5").unwrap(),
+            Decimal::parse("1.5000000000000001").unwrap()
+        );
+        // 接近零的小数。
+        assert_ne!(
+            Decimal::parse("1e-100000000").unwrap(),
+            Decimal::parse("2e-100000000").unwrap()
+        );
+    }
+
+    #[test]
+    fn decimal_handles_unbounded_integers_and_exponents() {
+        let huge = "1234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567891";
+        assert_eq!(
+            Decimal::parse(huge).unwrap(),
+            Decimal::parse(&format!("{huge}.000e0")).unwrap()
+        );
+        // 123e100000 == 123 后面跟 100000 个 0；指数运算走任意精度整数。
+        let expanded = format!("123{}", "0".repeat(100_000));
+        assert_eq!(
+            Decimal::parse("123e100000").unwrap(),
+            Decimal::parse(&expanded).unwrap()
+        );
+        assert_ne!(
+            Decimal::parse("124e100000").unwrap(),
+            Decimal::parse(&expanded).unwrap()
+        );
+        // 超大负指数的不同写法同样按数学值相等。
+        assert_eq!(
+            Decimal::parse("1e-100000000").unwrap(),
+            Decimal::parse("10e-100000001").unwrap()
+        );
+    }
+
+    #[test]
+    fn diff_treats_equal_number_forms_as_unchanged() {
+        let result = diff_ok(parse(
+            r#"{"before":[{"id":"r","values":{
+                "i": 1, "z": -0, "nested": {"k": 100e-2}, "arr": [1.0, {"q": 1e0}]
+            }}],"after":[{"id":"r","values":{
+                "i": 1.0, "z": 0, "nested": {"k": 1.00}, "arr": [100e-2, {"q": 10e-1}]
+            }}]}"#,
+        ));
+        assert_eq!(result, json!({"changes": []}));
+    }
+
+    #[test]
+    fn diff_finds_precise_numeric_change_everywhere_and_preserves_tokens() {
+        // 差异同时位于顶层、嵌套对象与数组中。
+        let result = diff_ok(parse(
+            r#"{"before":[{"id":"r","values":{
+                "big": 9007199254740993,
+                "obj": {"deep": [1, 123456789012345678901234567890]},
+                "tiny": 1e-100000000
+            }}],"after":[{"id":"r","values":{
+                "big": 9007199254740992.0,
+                "obj": {"deep": [1, 123456789012345678901234567891]},
+                "tiny": 2e-100000000
+            }}]}"#,
+        ));
+        let fields = result["changes"][0]["fields"].as_array().unwrap();
+        let paths: Vec<&str> = fields.iter().map(|f| f["path"].as_str().unwrap()).collect();
+        assert_eq!(paths, ["/big", "/obj/deep", "/tiny"]);
+
+        // old/new 必须逐字保留输入写法：不得舍入、转字符串或变 null。
+        let rendered = serde_json::to_string(&result).unwrap();
+        assert!(rendered.contains("9007199254740993"));
+        assert!(rendered.contains("9007199254740992.0"));
+        assert!(rendered.contains("123456789012345678901234567890"));
+        assert!(rendered.contains("123456789012345678901234567891"));
+        assert!(rendered.contains("1e-100000000"));
+        assert!(rendered.contains("2e-100000000"));
+        assert!(!rendered.contains("null"));
+    }
+
+    #[test]
+    fn apply_accepts_equal_forms_and_echoes_exact_target_numbers() {
+        // 预期侧 old 使用等值的不同写法（含嵌套对象中的大整数），应校验通过。
+        let new_big = "9876543210987654321098765432109876543210";
+        let request = parse(&format!(
+            r#"{{
+                "rows": [{{"id":"r","values":{{"x": 100e-2, "obj": {{"q": {new_big}.0}}}}}}],
+                "changes": [{{"id":"r","op":"update","fields":[
+                    {{"path":"/x","old": 1.0, "new": 1e5}},
+                    {{"path":"/obj/q","old": {new_big}, "new": -0.0}}
+                ]}}],
+                "direction": "forward"
+            }}"#
+        ));
+        let forward = apply_ok(request);
+        let rendered = serde_json::to_string(&forward).unwrap();
+        // 响应保持 update 目标侧的精确数值与写法。
+        assert!(rendered.contains("1e5"));
+        assert!(rendered.contains("-0"));
+        assert!(!rendered.contains(new_big));
+
+        // 反向恢复：当前值用 new 侧的等值写法 (-0 == 0) 也应通过，恢复 old 写法。
+        let backward = apply_ok(parse(
+            r#"{"rows":[{"id":"r","values":{"x":100000,"obj":{"q":0}}}],
+               "changes":[{"id":"r","op":"update","fields":[
+                   {"path":"/x","old":1.0,"new":1e5},
+                   {"path":"/obj/q","old":9876543210987654321098765432109876543210,"new":-0}
+               ]}],"direction":"reverse"}"#,
+        ));
+        let rendered = serde_json::to_string(&backward).unwrap();
+        assert!(rendered.contains("1.0"));
+        assert!(rendered.contains(new_big));
+    }
+
+    #[test]
+    fn apply_conflicts_on_real_numeric_difference_with_original_path() {
+        let err = apply(&parse(
+            r#"{"rows":[{"id":"r","values":{"x":9007199254740993}}],
+               "changes":[{"id":"r","op":"update","fields":[
+                   {"path":"/x","old":9007199254740992.0,"new":1}
+               ]}],"direction":"forward"}"#,
+        ))
+        .unwrap_err();
+        assert_eq!(err.status, 409);
+        assert_eq!(err.code, "conflict");
+        assert_eq!(err.path, "/changes/0/fields/0/old");
+    }
+
+    #[test]
+    fn apply_add_remove_match_equal_number_forms() {
+        // add 校验既有行内容时，等值不同写法应通过（反向 add）。
+        let request = parse(
+            r#"{"rows":[{"id":"r","values":{"big":123456789012345678901234567890}}],
+               "changes":[{"id":"r","op":"add","value":{"big":123456789012345678901234567890.0}}],
+               "direction":"reverse"}"#,
+        );
+        let result = apply_ok(request);
+        assert_eq!(result["rows"].as_array().unwrap().len(), 0);
+
+        // 真实差异仍冲突，且定位 /value。
+        let err = apply(&parse(
+            r#"{"rows":[{"id":"r","values":{"big":123456789012345678901234567890}}],
+               "changes":[{"id":"r","op":"remove","value":{"big":123456789012345678901234567891}}],
+               "direction":"forward"}"#,
+        ))
         .unwrap_err();
         assert_eq!(err.status, 409);
         assert_eq!(err.path, "/changes/0/value");
