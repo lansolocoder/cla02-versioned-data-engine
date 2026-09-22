@@ -387,12 +387,189 @@ fn json_eq(a: &Value, b: &Value) -> bool {
     }
 }
 
+/// JSON 数字的无损数学值：符号、归一化有效数字、10 进指数（无符号十进制串）。
+/// 相同数值的不同写法（1、1.0、1e0、100e-2）归一化后完全一致。
+/// 指数用字符串保存，避免任何宽度的整数溢出。
+#[derive(Debug, PartialEq, Eq)]
+struct DecimalValue {
+    negative: bool,
+    digits: String,
+    exp_negative: bool,
+    exp_magnitude: String,
+}
+
+/// 无损十进制比较：直接解析数字词法，全程不经过 f64。
+/// 依赖 serde_json 的 arbitrary_precision，Number 保留输入的原始词法。
 fn number_eq(a: &Number, b: &Number) -> bool {
-    if a.is_f64() || b.is_f64() {
-        a.as_f64() == b.as_f64()
+    decimal_value(a.as_str()) == decimal_value(b.as_str())
+}
+
+fn decimal_value(lexeme: &str) -> DecimalValue {
+    let bytes = lexeme.as_bytes();
+    let mut pos = 0;
+    let negative = bytes.first() == Some(&b'-');
+    if negative || bytes.first() == Some(&b'+') {
+        pos = 1;
+    }
+
+    let mut digits = String::with_capacity(lexeme.len());
+    let mut int_digits: Option<usize> = None;
+    while pos < bytes.len() {
+        match bytes[pos] {
+            b'0'..=b'9' => digits.push(bytes[pos] as char),
+            b'.' => int_digits = Some(digits.len()),
+            b'e' | b'E' => {
+                pos += 1;
+                break;
+            }
+            _ => {}
+        }
+        pos += 1;
+    }
+    // 小数点后的位数用于把尾数折算成整数（请求体大小内，必然适配 i64）。
+    let frac_digits = int_digits
+        .map(|n| digits.len() as i64 - n as i64)
+        .unwrap_or(0);
+
+    // 解析指数部分。
+    let mut exp_neg = false;
+    let mut exp_raw = String::new();
+    if pos < bytes.len() && (bytes[pos] == b'-' || bytes[pos] == b'+') {
+        exp_neg = bytes[pos] == b'-';
+        pos += 1;
+    }
+    while pos < bytes.len() {
+        if bytes[pos].is_ascii_digit() {
+            exp_raw.push(bytes[pos] as char);
+        }
+        pos += 1;
+    }
+    let mut exp_magnitude = normalize_magnitude(&exp_raw);
+    if exp_magnitude == "0" {
+        exp_neg = false;
+    }
+    // 值 = 有效整数 × 10^(指数 − 小数位数)。
+    (exp_neg, exp_magnitude) = exp_adjust(exp_neg, &exp_magnitude, -frac_digits);
+
+    // 去除前导零。
+    let start = digits
+        .bytes()
+        .position(|c| c != b'0')
+        .unwrap_or(digits.len());
+    if start == digits.len() {
+        // 0、-0、0.0、0e10 等一律归一化为正零。
+        return DecimalValue {
+            negative: false,
+            digits: "0".to_owned(),
+            exp_negative: false,
+            exp_magnitude: "0".to_owned(),
+        };
+    }
+    digits.replace_range(..start, "");
+
+    // 去除末尾零并相应抬高指数，数值保持不变；归一化后的尾数首尾均非零，
+    // 因此（符号、尾数、指数）三元组与数学值一一对应。
+    let trailing = digits.len() - digits.trim_end_matches('0').len();
+    digits.truncate(digits.len() - trailing);
+    (exp_neg, exp_magnitude) = exp_adjust(exp_neg, &exp_magnitude, trailing as i64);
+
+    DecimalValue {
+        negative,
+        digits,
+        exp_negative: exp_neg,
+        exp_magnitude,
+    }
+}
+
+fn normalize_magnitude(s: &str) -> String {
+    let trimmed = s.trim_start_matches('0');
+    if trimmed.is_empty() {
+        "0".to_owned()
     } else {
-        // 两侧均为整数时直接比较，避免浮点精度损失。
-        a == b
+        trimmed.to_owned()
+    }
+}
+
+fn magnitude_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    a.len().cmp(&b.len()).then_with(|| a.cmp(b))
+}
+
+/// 无符号十进制整数相加（入参均已去除前导零）。
+fn magnitude_add(a: &str, b: &str) -> String {
+    let (longer, shorter) = if a.len() >= b.len() { (a, b) } else { (b, a) };
+    let mut out = String::with_capacity(longer.len() + 1);
+    let mut carry = 0u8;
+    let mut lb = longer.as_bytes().iter().rev();
+    for sb in shorter.as_bytes().iter().rev() {
+        let sum = (sb - b'0') + (lb.next().unwrap() - b'0') + carry;
+        out.push((b'0' + sum % 10) as char);
+        carry = sum / 10;
+    }
+    for &c in lb {
+        let sum = (c - b'0') + carry;
+        out.push((b'0' + sum % 10) as char);
+        carry = sum / 10;
+    }
+    if carry > 0 {
+        out.push((b'0' + carry) as char);
+    }
+    out.chars().rev().collect()
+}
+
+/// 无符号十进制整数相减，要求 a >= b。
+fn magnitude_sub(a: &str, b: &str) -> String {
+    let mut out = String::with_capacity(a.len());
+    let mut borrow = 0i16;
+    let mut ia = a.as_bytes().iter().rev();
+    for sb in b.as_bytes().iter().rev() {
+        let digit = (ia.next().unwrap() - b'0') as i16 - (sb - b'0') as i16 - borrow;
+        let (digit, new_borrow) = if digit < 0 {
+            (digit + 10, 1)
+        } else {
+            (digit, 0)
+        };
+        out.push((b'0' + digit as u8) as char);
+        borrow = new_borrow;
+    }
+    for &c in ia {
+        let digit = (c - b'0') as i16 - borrow;
+        let (digit, new_borrow) = if digit < 0 {
+            (digit + 10, 1)
+        } else {
+            (digit, 0)
+        };
+        out.push((b'0' + digit as u8) as char);
+        borrow = new_borrow;
+    }
+    let result: String = out.chars().rev().collect();
+    normalize_magnitude(&result)
+}
+
+/// 带符号十进制大整数（符号 + 无符号十进制串）加上一个 i64 小量。
+fn exp_adjust(neg: bool, magnitude: &str, delta: i64) -> (bool, String) {
+    if magnitude == "0" {
+        if delta == 0 {
+            (false, "0".to_owned())
+        } else {
+            (
+                delta < 0,
+                normalize_magnitude(&delta.unsigned_abs().to_string()),
+            )
+        }
+    } else if delta == 0 {
+        (neg, magnitude.to_owned())
+    } else {
+        let d_magnitude = normalize_magnitude(&delta.unsigned_abs().to_string());
+        let d_neg = delta < 0;
+        if neg == d_neg {
+            (neg, magnitude_add(magnitude, &d_magnitude))
+        } else {
+            match magnitude_cmp(magnitude, &d_magnitude) {
+                std::cmp::Ordering::Greater => (neg, magnitude_sub(magnitude, &d_magnitude)),
+                std::cmp::Ordering::Less => (d_neg, magnitude_sub(&d_magnitude, magnitude)),
+                std::cmp::Ordering::Equal => (false, "0".to_owned()),
+            }
+        }
     }
 }
 
@@ -887,5 +1064,135 @@ mod tests {
         .unwrap_err();
         assert_eq!(err.status, 409);
         assert_eq!(err.path, "/changes/0/value");
+    }
+
+    #[test]
+    fn number_eq_is_lossless_decimal() {
+        let cases = [
+            ("1", "1.0"),
+            ("1", "1e0"),
+            ("1", "100e-2"),
+            ("1.0", "100e-2"),
+            ("-0", "0"),
+            ("-0.0", "0e5"),
+            ("0.01", "1e-2"),
+            ("12300", "12.3e3"),
+            ("-1.230", "-123e-2"),
+            ("0.5", "5E-1"),
+            ("1000000000000000000000", "1e21"),
+            ("9007199254740993", "9007199254740993.0"),
+            ("0.000000000000000000001", "1e-21"),
+            ("1e999999999999999999999", "10e999999999999999999998"),
+            ("1e-999999999999999999999", "0.1e-999999999999999999998"),
+        ];
+        for (a, b) in cases {
+            assert!(number_eq(&number(a), &number(b)), "expected {a} == {b}");
+        }
+
+        let different = [
+            ("9007199254740993", "9007199254740992.0"),
+            ("9007199254740993", "9007199254740992"),
+            ("1", "1.0000000000000001"),
+            ("0.1", "0.10000000000000001"),
+            ("1e999999999999999999999", "2e999999999999999999999"),
+            ("1e-999999999999999999999", "2e-999999999999999999999"),
+            ("1e21", "1e22"),
+            ("-1", "1"),
+        ];
+        for (a, b) in different {
+            assert!(!number_eq(&number(a), &number(b)), "expected {a} != {b}");
+        }
+    }
+
+    fn number(lexeme: &str) -> Number {
+        let value: Value = serde_json::from_str(lexeme).unwrap();
+        value.as_number().unwrap().clone()
+    }
+
+    #[test]
+    fn diff_detects_precision_differences_everywhere() {
+        // 同值不同写法（嵌套对象与数组中）不产生 change。
+        let result = diff_ok(
+            serde_json::from_str(
+                r#"{
+                "before": [{"id": "r", "values": {"a": [1, {"b": 100e-2}], "c": -0}}],
+                "after":  [{"id": "r", "values": {"a": [1.0, {"b": 1e0}], "c": 0}}]
+            }"#,
+            )
+            .unwrap(),
+        );
+        assert_eq!(result, json!({"changes": []}));
+
+        // 2^53 附近的真实差异必须被发现，且原始写法原样回传。
+        let result = diff_ok(serde_json::from_str(
+            r#"{
+                "before": [{"id": "r", "values": {"x": 9007199254740992.0, "deep": {"y": [1e21]}}}],
+                "after":  [{"id": "r", "values": {"x": 9007199254740993, "deep": {"y": [1000000000000000000001]}}}]
+            }"#,
+        ).unwrap());
+        assert_eq!(
+            result,
+            serde_json::from_str::<Value>(
+                r#"{"changes":[{"id":"r","op":"update","fields":[
+                    {"path":"/deep/y","old":[1e21],"new":[1000000000000000000001]},
+                    {"path":"/x","old":9007199254740992.0,"new":9007199254740993}
+                ]}]}"#
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn apply_accepts_equivalent_forms_and_rejects_real_precision_diff() {
+        // old 用不同写法表示同一数值 → 通过，new 精确写入。
+        let result = apply_ok(
+            serde_json::from_str(
+                r#"{
+                "rows": [{"id": "r", "values": {"x": 9007199254740993, "y": [1e21]}}],
+                "changes": [{"id": "r", "op": "update", "fields": [
+                    {"path": "/x", "old": 9007199254740993.000, "new": 100e-2},
+                    {"path": "/y", "old": [1000000000000000000000], "new": 1e-999}
+                ]}],
+                "direction": "forward"
+            }"#,
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            result,
+            serde_json::from_str::<Value>(
+                r#"{"rows":[{"id":"r","values":{"x":100e-2,"y":1e-999}}]}"#
+            )
+            .unwrap()
+        );
+
+        // 2^53 边界相差 1 → 409，path 保持原样，且不部分应用。
+        let err = apply(
+            &serde_json::from_str(
+                r#"{
+                    "rows": [{"id": "r", "values": {"x": 9007199254740993}}],
+                    "changes": [{"id": "r", "op": "update", "fields": [
+                        {"path": "/x", "old": 9007199254740992.0, "new": 1}
+                    ]}],
+                    "direction": "forward"
+                }"#,
+            )
+            .unwrap(),
+        )
+        .unwrap_err();
+        assert_eq!(err.status, 409);
+        assert_eq!(err.path, "/changes/0/fields/0/old");
+
+        // add 行整体值：等价值写法通过反向校验。
+        apply_ok(
+            serde_json::from_str(
+                r#"{
+                "rows": [{"id": "r", "values": {"n": 1}}],
+                "changes": [{"id": "r", "op": "add", "value": {"n": 1.0}}],
+                "direction": "reverse"
+            }"#,
+            )
+            .unwrap(),
+        );
     }
 }
