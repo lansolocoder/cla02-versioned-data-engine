@@ -423,7 +423,9 @@ name = "versioned-data-engine"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "percent-encoding",
  "serde",
+ "serde_json",
  "tokio",
 ]
 
