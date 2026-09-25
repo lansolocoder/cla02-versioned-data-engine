@@ -14,6 +14,10 @@ use std::{
     collections::{BTreeMap, HashSet},
     env,
     error::Error,
+    ffi::OsStr,
+    fs::{self, File},
+    io::Write,
+    path::{Path, PathBuf},
     sync::{Mutex, MutexGuard},
 };
 
@@ -36,10 +40,35 @@ struct Store {
     snapshots: Vec<Snapshot>,
 }
 
+/// 磁盘上的状态文件布局。版本号显式存储，恢复后版本序列严格接续旧序列。
+#[derive(Serialize, Deserialize)]
+struct PersistedState {
+    /// 固定为 1，供未来格式演进时区分。
+    format: u32,
+    /// 当前数据集，序列化为 [key, fields] 对的数组。
+    dataset: Vec<PersistedRecord>,
+    /// 已保存快照，版本号必须从 1 起严格连续。
+    snapshots: Vec<PersistedSnapshot>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PersistedRecord {
+    key: String,
+    fields: Value,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PersistedSnapshot {
+    version: u64,
+    records: Vec<PersistedRecord>,
+}
+
 #[derive(Clone)]
 struct AppState {
     /// 所有读写都经过同一把锁，保证批次写入与快照保存对并发交错整体可见。
     store: std::sync::Arc<Mutex<Store>>,
+    /// 状态文件路径；每次成功提交后原子重写该文件。
+    data_file: std::sync::Arc<PathBuf>,
 }
 
 #[derive(Serialize)]
@@ -111,6 +140,177 @@ fn bad_request(message: impl Into<String>) -> (StatusCode, Json<ErrorBody>) {
             index: None,
         }),
     )
+}
+
+fn server_error(message: impl Into<String>) -> (StatusCode, Json<ErrorBody>) {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(ErrorBody {
+            error: message.into(),
+            index: None,
+        }),
+    )
+}
+
+/// 给路径末尾再追加一个扩展名：`vde-state.json` -> `vde-state.json.tmp`。
+trait WithExtraExtension {
+    fn with_extra_extension(&self, extra: &str) -> PathBuf;
+}
+
+impl WithExtraExtension for Path {
+    fn with_extra_extension(&self, extra: &str) -> PathBuf {
+        let mut file_name = self.file_name().map(OsStr::to_owned).unwrap_or_default();
+        file_name.push(format!(".{extra}"));
+        self.with_file_name(file_name)
+    }
+}
+
+/// 状态文件名，位于 VDE_DATA_DIR（缺省为当前工作目录下的 data）。
+const STATE_FILE_NAME: &str = "vde-state.json";
+
+fn data_file_path() -> PathBuf {
+    let dir = env::var_os("VDE_DATA_DIR")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("data"));
+    dir.join(STATE_FILE_NAME)
+}
+
+/// 把内存状态序列化并原子替换状态文件：先写同目录临时文件并 fsync，再 rename。
+/// 任何时刻状态文件要么是旧的完整内容、要么是新的完整内容，不会留下截断文件。
+fn persist_store(store: &Store, data_file: &Path) -> std::io::Result<()> {
+    let persisted = PersistedState {
+        format: 1,
+        dataset: store
+            .dataset
+            .iter()
+            .map(|(key, fields)| PersistedRecord {
+                key: key.clone(),
+                fields: Value::Object(fields.clone()),
+            })
+            .collect(),
+        snapshots: store
+            .snapshots
+            .iter()
+            .map(|s| PersistedSnapshot {
+                version: s.version,
+                records: s
+                    .records
+                    .iter()
+                    .map(|(key, fields)| PersistedRecord {
+                        key: key.clone(),
+                        fields: fields.clone(),
+                    })
+                    .collect(),
+            })
+            .collect(),
+    };
+
+    // 序列化在持锁状态下完成；失败不会触及磁盘文件。
+    let payload = serde_json::to_vec_pretty(&persisted).map_err(std::io::Error::other)?;
+
+    if let Some(dir) = data_file.parent() {
+        fs::create_dir_all(dir)?;
+    }
+
+    let tmp = data_file.with_extra_extension("tmp");
+    {
+        let mut file = File::create(&tmp)?;
+        file.write_all(&payload)?;
+        file.write_all(b"\n")?;
+        file.sync_all()?;
+    }
+    fs::rename(&tmp, data_file)?;
+
+    // fsync 目录，确保 rename 本身落盘（崩溃恢复语义更稳）。
+    if let Some(dir) = data_file.parent()
+        && let Ok(dir_file) = File::open(dir)
+    {
+        let _ = dir_file.sync_all();
+    }
+    Ok(())
+}
+
+/// 严格校验并恢复状态。文件不存在时返回空状态；文件存在但无法解析或结构不合法时
+/// 返回错误，调用方必须拒绝启动，且本函数绝不改动原文件。
+fn load_store(data_file: &Path) -> Result<Store, String> {
+    let bytes = match fs::read(data_file) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Store::default()),
+        Err(e) => return Err(format!("无法读取状态文件 {}: {e}", data_file.display())),
+    };
+
+    let persisted: PersistedState = serde_json::from_slice(&bytes).map_err(|e| {
+        format!(
+            "状态文件 {} 不是合法 JSON，拒绝启动: {e}",
+            data_file.display()
+        )
+    })?;
+
+    if persisted.format != 1 {
+        return Err(format!(
+            "状态文件 {} 的 format 为 {}，本版本仅支持 1",
+            data_file.display(),
+            persisted.format
+        ));
+    }
+
+    let mut dataset: Dataset = BTreeMap::new();
+    for record in persisted.dataset {
+        let Value::Object(fields) = record.fields else {
+            return Err(format!(
+                "状态文件 {} 中数据集键 {} 的 fields 不是 JSON 对象",
+                data_file.display(),
+                record.key
+            ));
+        };
+        if dataset.insert(record.key.clone(), fields).is_some() {
+            return Err(format!(
+                "状态文件 {} 的数据集中键 {} 重复",
+                data_file.display(),
+                record.key
+            ));
+        }
+    }
+
+    let mut snapshots: Vec<Snapshot> = Vec::with_capacity(persisted.snapshots.len());
+    for (index, snap) in persisted.snapshots.into_iter().enumerate() {
+        let expected = index as u64 + 1;
+        if snap.version != expected {
+            return Err(format!(
+                "状态文件 {} 的快照版本序列不连续：第 {} 份快照版本为 {}，应为 {}",
+                data_file.display(),
+                expected,
+                snap.version,
+                expected
+            ));
+        }
+        let mut records: BTreeMap<String, Value> = BTreeMap::new();
+        for record in snap.records {
+            let Value::Object(_) = &record.fields else {
+                return Err(format!(
+                    "状态文件 {} 中版本 {} 键 {} 的 fields 不是 JSON 对象",
+                    data_file.display(),
+                    snap.version,
+                    record.key
+                ));
+            };
+            if records.insert(record.key.clone(), record.fields).is_some() {
+                return Err(format!(
+                    "状态文件 {} 的版本 {} 中键 {} 重复",
+                    data_file.display(),
+                    snap.version,
+                    record.key
+                ));
+            }
+        }
+        snapshots.push(Snapshot {
+            version: snap.version,
+            records,
+        });
+    }
+
+    Ok(Store { dataset, snapshots })
 }
 
 /// 手动解析查询串（percent-decode 后取 version / key）。
@@ -211,20 +411,38 @@ async fn write_records(
         batch.push((key, fields));
     }
 
-    // 全部合法：持锁整体覆盖写入。任一条非法都在上面提前返回，数据集保持原状。
+    // 全部合法：持锁整体覆盖写入，并在同一临界区把新状态落盘。
+    // 落盘失败则精确回滚本批改动、返回 500，数据集保持请求前状态。
     let mut store = state.store.lock().unwrap();
-    let written = batch.len();
-    for (key, fields) in batch {
-        store.dataset.insert(key, fields);
+    let mut previous: Vec<(String, Option<Fields>)> = Vec::with_capacity(batch.len());
+    for (key, fields) in &batch {
+        previous.push((key.clone(), store.dataset.get(key).cloned()));
+        store.dataset.insert(key.clone(), fields.clone());
     }
+    if let Err(e) = persist_store(&store, &state.data_file) {
+        for (key, old) in previous {
+            match old {
+                Some(fields) => {
+                    store.dataset.insert(key, fields);
+                }
+                None => {
+                    store.dataset.remove(&key);
+                }
+            }
+        }
+        return Err(server_error(format!("状态落盘失败: {e}")));
+    }
+    let total = store.dataset.len();
     Ok(Json(WriteResponse {
-        written,
-        total: store.dataset.len(),
+        written: batch.len(),
+        total,
     }))
 }
 
 /// POST /versions：把当前数据集固化为不可变快照。
-async fn save_version(State(state): State<AppState>) -> Json<SaveResponse> {
+async fn save_version(
+    State(state): State<AppState>,
+) -> Result<Json<SaveResponse>, (StatusCode, Json<ErrorBody>)> {
     let mut store: MutexGuard<Store> = state.store.lock().unwrap();
     let version = store.snapshots.len() as u64 + 1;
     let records = store
@@ -234,7 +452,13 @@ async fn save_version(State(state): State<AppState>) -> Json<SaveResponse> {
         .collect();
     let total = store.dataset.len();
     store.snapshots.push(Snapshot { version, records });
-    Json(SaveResponse { version, total })
+
+    // 与写入同一套原子提交：落盘失败则撤回刚追加的快照。
+    if let Err(e) = persist_store(&store, &state.data_file) {
+        store.snapshots.pop();
+        return Err(server_error(format!("状态落盘失败: {e}")));
+    }
+    Ok(Json(SaveResponse { version, total }))
 }
 
 /// GET /snapshots?version=N[&key=K]：读取历史快照。
@@ -297,9 +521,34 @@ async fn get_snapshot(
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     let bind = env::var("VDE_BIND").unwrap_or_else(|_| "127.0.0.1:8080".to_owned());
-    let listener = tokio::net::TcpListener::bind(&bind).await?;
+    let data_file = std::sync::Arc::new(data_file_path());
+
+    // 启动恢复必须在对外服务之前完成：文件损坏则报错到 stderr 并非零退出，
+    // 不绑定端口、不载入半份数据、也不改动原文件。
+    let store = match load_store(&data_file) {
+        Ok(store) => store,
+        Err(message) => {
+            eprintln!("{message}");
+            std::process::exit(1);
+        }
+    };
+    if data_file.exists() {
+        eprintln!(
+            "已从 {} 恢复：数据集 {} 条记录，快照 {} 个版本",
+            data_file.display(),
+            store.dataset.len(),
+            store.snapshots.len()
+        );
+    } else {
+        eprintln!(
+            "状态文件 {} 不存在，以空数据集启动（尚无快照）",
+            data_file.display()
+        );
+    }
+
     let state = AppState {
-        store: std::sync::Arc::new(Mutex::new(Store::default())),
+        store: std::sync::Arc::new(Mutex::new(store)),
+        data_file,
     };
     let app = Router::new()
         .route("/health", get(health))
@@ -309,6 +558,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .route("/snapshots", get(get_snapshot))
         .with_state(state);
 
+    let listener = tokio::net::TcpListener::bind(&bind).await?;
     println!("Listening on http://{}", listener.local_addr()?);
     axum::serve(listener, app)
         .with_graceful_shutdown(async {
