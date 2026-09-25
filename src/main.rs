@@ -14,8 +14,12 @@ use std::{
     collections::{BTreeMap, HashSet},
     env,
     error::Error,
+    process,
     sync::{Mutex, MutexGuard},
 };
+
+mod persist;
+use persist::Persist;
 
 /// 一条记录的字段集：任意 JSON 对象。
 type Fields = Map<String, Value>;
@@ -29,11 +33,12 @@ struct Snapshot {
     records: BTreeMap<String, Value>,
 }
 
-#[derive(Default)]
 struct Store {
     dataset: Dataset,
     /// 已保存快照，下标 0 对应版本 1。
     snapshots: Vec<Snapshot>,
+    /// 持久化句柄；None 表示 VDE_DATA_DIR 未设置，纯内存运行。
+    persist: Option<Persist>,
 }
 
 #[derive(Clone)]
@@ -106,6 +111,17 @@ struct ErrorBody {
 fn bad_request(message: impl Into<String>) -> (StatusCode, Json<ErrorBody>) {
     (
         StatusCode::BAD_REQUEST,
+        Json(ErrorBody {
+            error: message.into(),
+            index: None,
+        }),
+    )
+}
+
+/// 持久化等内部故障：返回 500，且此时内存状态尚未修改，客户端可安全重试。
+fn internal_error(message: impl Into<String>) -> (StatusCode, Json<ErrorBody>) {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
         Json(ErrorBody {
             error: message.into(),
             index: None,
@@ -211,8 +227,14 @@ async fn write_records(
         batch.push((key, fields));
     }
 
-    // 全部合法：持锁整体覆盖写入。任一条非法都在上面提前返回，数据集保持原状。
+    // 全部合法：持锁提交。持久化模式下先做原子落盘，只有落盘成功后才修改内存，
+    // 因此崩溃时不会出现「磁盘有半截事件、内存已提交」之类的不一致。
     let mut store = state.store.lock().unwrap();
+    if let Some(persist) = store.persist.as_mut()
+        && let Err(e) = persist.commit_writes(&batch)
+    {
+        return Err(internal_error(format!("持久化写入失败: {e}")));
+    }
     let written = batch.len();
     for (key, fields) in batch {
         store.dataset.insert(key, fields);
@@ -224,17 +246,25 @@ async fn write_records(
 }
 
 /// POST /versions：把当前数据集固化为不可变快照。
-async fn save_version(State(state): State<AppState>) -> Json<SaveResponse> {
+async fn save_version(
+    State(state): State<AppState>,
+) -> Result<Json<SaveResponse>, (StatusCode, Json<ErrorBody>)> {
     let mut store: MutexGuard<Store> = state.store.lock().unwrap();
     let version = store.snapshots.len() as u64 + 1;
     let records = store
         .dataset
         .iter()
         .map(|(key, fields)| (key.clone(), Value::Object(fields.clone())))
-        .collect();
+        .collect::<BTreeMap<_, _>>();
     let total = store.dataset.len();
+    // 完整快照原子落盘：rename 成功即提交，失败则版本号不前进、内存也不推进。
+    if let Some(persist) = store.persist.as_mut()
+        && let Err(e) = persist.commit_snapshot(version, &records)
+    {
+        return Err(internal_error(format!("持久化快照失败: {e}")));
+    }
     store.snapshots.push(Snapshot { version, records });
-    Json(SaveResponse { version, total })
+    Ok(Json(SaveResponse { version, total }))
 }
 
 /// GET /snapshots?version=N[&key=K]：读取历史快照。
@@ -297,9 +327,41 @@ async fn get_snapshot(
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     let bind = env::var("VDE_BIND").unwrap_or_else(|_| "127.0.0.1:8080".to_owned());
+
+    // VDE_DATA_DIR 未设置时完全保持纯内存行为，不创建、不写入任何文件。
+    // 设置时先抢目录锁并做完整性恢复；被占用或数据损坏都拒绝启动（退出码非 0）。
+    let store = match env::var_os("VDE_DATA_DIR") {
+        None => Store {
+            dataset: Dataset::new(),
+            snapshots: Vec::new(),
+            persist: None,
+        },
+        Some(dir) => {
+            let path = std::path::PathBuf::from(dir);
+            match persist::open(path) {
+                Ok((dataset, snapshots, handle)) => {
+                    eprintln!(
+                        "已从持久化目录恢复: {} 条当前记录, {} 个历史快照",
+                        dataset.len(),
+                        snapshots.len()
+                    );
+                    Store {
+                        dataset,
+                        snapshots,
+                        persist: Some(handle),
+                    }
+                }
+                Err(error) => {
+                    eprintln!("{error}");
+                    process::exit(1);
+                }
+            }
+        }
+    };
+
     let listener = tokio::net::TcpListener::bind(&bind).await?;
     let state = AppState {
-        store: std::sync::Arc::new(Mutex::new(Store::default())),
+        store: std::sync::Arc::new(Mutex::new(store)),
     };
     let app = Router::new()
         .route("/health", get(health))
