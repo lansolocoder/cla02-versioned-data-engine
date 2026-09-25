@@ -14,7 +14,8 @@ use std::{
     collections::{BTreeMap, HashSet},
     env,
     error::Error,
-    sync::{Mutex, MutexGuard},
+    io::Write,
+    sync::{Arc, Mutex, MutexGuard},
 };
 
 /// 一条记录的字段集：任意 JSON 对象。
@@ -39,7 +40,95 @@ struct Store {
 #[derive(Clone)]
 struct AppState {
     /// 所有读写都经过同一把锁，保证批次写入与快照保存对并发交错整体可见。
-    store: std::sync::Arc<Mutex<Store>>,
+    store: Arc<Mutex<Store>>,
+}
+
+/// 落盘文件格式（内部契约，不对外公开）：当前数据集 + 全部已保存快照。
+/// 每份快照冗余记录总数 total，加载时校验版本连续性与记录数一致性。
+#[derive(Serialize, Deserialize)]
+struct PersistedState {
+    dataset: Dataset,
+    snapshots: Vec<PersistedSnapshot>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PersistedSnapshot {
+    version: u64,
+    total: usize,
+    records: BTreeMap<String, Value>,
+}
+
+/// 启动时从 VDE_DATA 恢复状态。文件不存在时按空数据集与零快照启动；
+/// 文件存在但格式非法或内容自相矛盾时返回错误，由调用方决定退出。
+fn load_store(path: &str) -> Result<Store, String> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Store::default()),
+        Err(err) => return Err(format!("读取失败: {err}")),
+    };
+
+    let persisted: PersistedState =
+        serde_json::from_slice(&bytes).map_err(|e| format!("文件格式非法: {e}"))?;
+
+    let mut snapshots = Vec::with_capacity(persisted.snapshots.len());
+    for (index, snap) in persisted.snapshots.into_iter().enumerate() {
+        let expected = index as u64 + 1;
+        if snap.version != expected {
+            return Err(format!(
+                "快照版本号未从 1 连续递增: 期望 {expected}, 实际 {}",
+                snap.version
+            ));
+        }
+        if snap.total != snap.records.len() {
+            return Err(format!(
+                "快照 {} 记录数与实际不符: 声明 {}, 实际 {}",
+                snap.version,
+                snap.total,
+                snap.records.len()
+            ));
+        }
+        snapshots.push(Snapshot {
+            version: snap.version,
+            records: snap.records,
+        });
+    }
+
+    Ok(Store {
+        dataset: persisted.dataset,
+        snapshots,
+    })
+}
+
+/// 正常退出时把当前状态原子写入 VDE_DATA：先写同目录临时文件并 fsync，
+/// 再改名覆盖目标文件，任何一步失败都不会留下半写的目标文件。
+fn save_store(path: &str, store: &Store) -> Result<(), String> {
+    let persisted = PersistedState {
+        dataset: store.dataset.clone(),
+        snapshots: store
+            .snapshots
+            .iter()
+            .map(|s| PersistedSnapshot {
+                version: s.version,
+                total: s.records.len(),
+                records: s.records.clone(),
+            })
+            .collect(),
+    };
+    let bytes = serde_json::to_vec(&persisted).map_err(|e| format!("序列化状态失败: {e}"))?;
+
+    let tmp_path = format!("{path}.tmp");
+    let result = (|| -> std::io::Result<()> {
+        let mut file = std::fs::File::create(&tmp_path)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        std::fs::rename(&tmp_path, path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        // 清理临时文件；目标文件保持原内容不变。
+        let _ = std::fs::remove_file(&tmp_path);
+    }
+    result.map_err(|e| format!("写入失败: {e}"))
 }
 
 #[derive(Serialize)]
@@ -296,10 +385,28 @@ async fn get_snapshot(
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
+    // VDE_DATA 必须提供：缺失或为空时以退出码 2 结束，不监听端口。
+    let data_path = match env::var("VDE_DATA") {
+        Ok(path) if !path.is_empty() => path,
+        _ => {
+            eprintln!("错误: 缺少环境变量 VDE_DATA（持久化文件路径）");
+            std::process::exit(2);
+        }
+    };
+
+    // 启动时恢复上次持久化的状态；文件非法时以退出码 1 结束，不监听端口。
+    let store = match load_store(&data_path) {
+        Ok(store) => store,
+        Err(err) => {
+            eprintln!("错误: 无法从 {data_path} 恢复状态: {err}");
+            std::process::exit(1);
+        }
+    };
+
     let bind = env::var("VDE_BIND").unwrap_or_else(|_| "127.0.0.1:8080".to_owned());
     let listener = tokio::net::TcpListener::bind(&bind).await?;
     let state = AppState {
-        store: std::sync::Arc::new(Mutex::new(Store::default())),
+        store: Arc::new(Mutex::new(store)),
     };
     let app = Router::new()
         .route("/health", get(health))
@@ -307,13 +414,21 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .route("/datasets/records", post(write_records))
         .route("/versions", post(save_version))
         .route("/snapshots", get(get_snapshot))
-        .with_state(state);
+        .with_state(state.clone());
 
     println!("Listening on http://{}", listener.local_addr()?);
+    // Ctrl-C 触发正常退出：先停止接收新请求并等待在途请求完成。
     axum::serve(listener, app)
         .with_graceful_shutdown(async {
             let _ = tokio::signal::ctrl_c().await;
         })
         .await?;
+
+    // 在途请求已全部完成，把数据集与全部快照原子落盘；失败时以退出码 1 结束。
+    let store = state.store.lock().unwrap();
+    if let Err(err) = save_store(&data_path, &store) {
+        eprintln!("错误: 状态落盘到 {data_path} 失败: {err}");
+        std::process::exit(1);
+    }
     Ok(())
 }
