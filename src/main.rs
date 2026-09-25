@@ -96,6 +96,26 @@ struct SnapshotParams {
     key: Option<String>,
 }
 
+/// GET /snapshots/diff 查询参数：必选 from 与 to。
+struct DiffParams {
+    from: u64,
+    to: u64,
+}
+
+#[derive(Serialize)]
+struct ChangeOut {
+    key: String,
+    change: &'static str,
+    fields: Value,
+}
+
+#[derive(Serialize)]
+struct DiffResponse {
+    from: u64,
+    to: u64,
+    changes: Vec<ChangeOut>,
+}
+
 #[derive(Serialize)]
 struct ErrorBody {
     error: String,
@@ -140,6 +160,40 @@ fn parse_snapshot_query(uri: &Uri) -> Result<SnapshotParams, String> {
     match version {
         Some(version) => Ok(SnapshotParams { version, key }),
         None => Err("缺少必填查询参数 version".to_owned()),
+    }
+}
+
+/// 手动解析比较查询串（percent-decode 后取 from / to，均必须是正整数）。
+fn parse_diff_query(uri: &Uri) -> Result<DiffParams, String> {
+    let mut from: Option<u64> = None;
+    let mut to: Option<u64> = None;
+    if let Some(query) = uri.query() {
+        for pair in query.split('&') {
+            let Some((raw_name, raw_value)) = pair.split_once('=') else {
+                return Err(format!("非法查询参数: {pair}"));
+            };
+            let name = percent_decode_str(raw_name).decode_utf8_lossy();
+            let value = percent_decode_str(raw_value).decode_utf8_lossy();
+            let parse_version = |label: &str| -> Result<u64, String> {
+                let parsed: u64 = value
+                    .parse()
+                    .map_err(|_| format!("{label} 必须是正整数: {value}"))?;
+                if parsed == 0 {
+                    return Err(format!("{label} 必须是正整数: {value}"));
+                }
+                Ok(parsed)
+            };
+            match name.as_ref() {
+                "from" => from = Some(parse_version("from")?),
+                "to" => to = Some(parse_version("to")?),
+                other => return Err(format!("未知查询参数: {other}")),
+            }
+        }
+    }
+    match (from, to) {
+        (Some(from), Some(to)) => Ok(DiffParams { from, to }),
+        (None, _) => Err("缺少必填查询参数 from".to_owned()),
+        (_, None) => Err("缺少必填查询参数 to".to_owned()),
     }
 }
 
@@ -294,6 +348,108 @@ async fn get_snapshot(
     }
 }
 
+/// GET /snapshots/diff?from=N&to=M：比较两份快照的记录级变化。
+async fn diff_snapshots(
+    State(state): State<AppState>,
+    req: Request,
+) -> Result<Json<DiffResponse>, (StatusCode, Json<ErrorBody>)> {
+    let params = parse_diff_query(req.uri()).map_err(bad_request)?;
+
+    let store = state.store.lock().unwrap();
+    let find = |version: u64| {
+        store
+            .snapshots
+            .iter()
+            .find(|s| s.version == version)
+            .cloned()
+            .ok_or_else(|| {
+                (
+                    StatusCode::NOT_FOUND,
+                    Json(ErrorBody {
+                        error: format!("版本 {version} 不存在或尚未保存"),
+                        index: None,
+                    }),
+                )
+            })
+    };
+    let from_snapshot = find(params.from)?;
+    let to_snapshot = find(params.to)?;
+
+    // 两份快照的 records 都是 BTreeMap，按键归并即得字典序的键并集。
+    let mut changes = Vec::new();
+    let mut from_iter = from_snapshot.records.iter().peekable();
+    let mut to_iter = to_snapshot.records.iter().peekable();
+    loop {
+        match (from_iter.peek(), to_iter.peek()) {
+            (Some(&(from_key, from_fields)), Some(&(to_key, to_fields))) => {
+                use std::cmp::Ordering::*;
+                match from_key.cmp(to_key) {
+                    Less => {
+                        changes.push(ChangeOut {
+                            key: from_key.clone(),
+                            change: "removed",
+                            fields: from_fields.clone(),
+                        });
+                        from_iter.next();
+                    }
+                    Greater => {
+                        changes.push(ChangeOut {
+                            key: to_key.clone(),
+                            change: "added",
+                            fields: to_fields.clone(),
+                        });
+                        to_iter.next();
+                    }
+                    Equal => {
+                        // serde_json::Value 的相等即 JSON 值语义，与对象内字段顺序无关。
+                        let (change, fields) = if from_fields == to_fields {
+                            ("unchanged", Value::Null)
+                        } else {
+                            (
+                                "modified",
+                                serde_json::json!({
+                                    "from": from_fields,
+                                    "to": to_fields,
+                                }),
+                            )
+                        };
+                        changes.push(ChangeOut {
+                            key: from_key.clone(),
+                            change,
+                            fields,
+                        });
+                        from_iter.next();
+                        to_iter.next();
+                    }
+                }
+            }
+            (Some(&(from_key, from_fields)), None) => {
+                changes.push(ChangeOut {
+                    key: from_key.clone(),
+                    change: "removed",
+                    fields: from_fields.clone(),
+                });
+                from_iter.next();
+            }
+            (None, Some(&(to_key, to_fields))) => {
+                changes.push(ChangeOut {
+                    key: to_key.clone(),
+                    change: "added",
+                    fields: to_fields.clone(),
+                });
+                to_iter.next();
+            }
+            (None, None) => break,
+        }
+    }
+
+    Ok(Json(DiffResponse {
+        from: from_snapshot.version,
+        to: to_snapshot.version,
+        changes,
+    }))
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     let bind = env::var("VDE_BIND").unwrap_or_else(|_| "127.0.0.1:8080".to_owned());
@@ -307,6 +463,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .route("/datasets/records", post(write_records))
         .route("/versions", post(save_version))
         .route("/snapshots", get(get_snapshot))
+        .route("/snapshots/diff", get(diff_snapshots))
         .with_state(state);
 
     println!("Listening on http://{}", listener.local_addr()?);
