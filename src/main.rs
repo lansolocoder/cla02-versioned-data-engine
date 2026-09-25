@@ -1,3 +1,5 @@
+mod persistence;
+
 use axum::{
     Json, Router,
     body::Bytes,
@@ -14,6 +16,8 @@ use std::{
     collections::{BTreeMap, HashSet},
     env,
     error::Error,
+    path::PathBuf,
+    process,
     sync::{Mutex, MutexGuard},
 };
 
@@ -32,14 +36,18 @@ struct Snapshot {
 #[derive(Default)]
 struct Store {
     dataset: Dataset,
-    /// 已保存快照，下标 0 对应版本 1。
+    /// 已保存快照；恢复时版本号允许有缺号，因此不能再用长度推导版本。
     snapshots: Vec<Snapshot>,
+    /// 下一个可分配的版本号，全新实例从 1 开始。
+    next_version: u64,
 }
 
 #[derive(Clone)]
 struct AppState {
     /// 所有读写都经过同一把锁，保证批次写入与快照保存对并发交错整体可见。
     store: std::sync::Arc<Mutex<Store>>,
+    /// 持久化根目录（来自 VDE_DATA_DIR，启动时已校验存在且为目录）。
+    data_dir: PathBuf,
 }
 
 #[derive(Serialize)]
@@ -277,18 +285,34 @@ async fn write_records(
     }))
 }
 
-/// POST /versions：把当前数据集固化为不可变快照。
-async fn save_version(State(state): State<AppState>) -> Json<SaveResponse> {
+/// POST /versions：把当前数据集固化为不可变快照，并原子落盘。
+async fn save_version(
+    State(state): State<AppState>,
+) -> Result<Json<SaveResponse>, (StatusCode, Json<ErrorBody>)> {
     let mut store: MutexGuard<Store> = state.store.lock().unwrap();
-    let version = store.snapshots.len() as u64 + 1;
+    let version = store.next_version;
     let records = store
         .dataset
         .iter()
         .map(|(key, fields)| (key.clone(), Value::Object(fields.clone())))
         .collect();
     let total = store.dataset.len();
+
+    // 先落盘、后推进内存：写盘失败时数据集与版本号都保持保存前的状态，
+    // 磁盘上也不会留下本次保存的任何痕迹，同一版本号下次可复用。
+    persistence::write_entry(&state.data_dir, version, &store.dataset).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorBody {
+                error: format!("版本 {version} 持久化失败: {e}"),
+                index: None,
+            }),
+        )
+    })?;
+
     store.snapshots.push(Snapshot { version, records });
-    Json(SaveResponse { version, total })
+    store.next_version += 1;
+    Ok(Json(SaveResponse { version, total }))
 }
 
 /// GET /snapshots?version=N[&key=K]：读取历史快照。
@@ -452,10 +476,64 @@ async fn diff_snapshots(
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
+    // 持久化根目录是必需配置：缺失、为空或指向非目录都视为配置错误，
+    // 打印一行说明后以非零码退出，不创建任何目录、不启动服务。
+    let data_dir = match env::var("VDE_DATA_DIR") {
+        Ok(value) if !value.is_empty() => PathBuf::from(value),
+        _ => {
+            eprintln!(
+                "配置错误: 必须设置环境变量 VDE_DATA_DIR 指向持久化根目录（当前未设置或为空）"
+            );
+            process::exit(2);
+        }
+    };
+    match std::fs::metadata(&data_dir) {
+        Ok(meta) if meta.is_dir() => {}
+        Ok(_) => {
+            eprintln!(
+                "配置错误: VDE_DATA_DIR 指向的不是目录: {}",
+                data_dir.display()
+            );
+            process::exit(2);
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            if let Err(e) = std::fs::create_dir_all(&data_dir) {
+                eprintln!("配置错误: 无法创建持久化目录 {}: {e}", data_dir.display());
+                process::exit(2);
+            }
+        }
+        Err(e) => {
+            eprintln!("配置错误: 无法访问持久化目录 {}: {e}", data_dir.display());
+            process::exit(2);
+        }
+    }
+
+    // 加载已持久化状态；目录为空时按全新实例启动（版本号从 1 开始）。
+    let loaded = match persistence::load(&data_dir) {
+        Ok(loaded) => loaded,
+        Err(e) => {
+            eprintln!("启动失败: 无法读取持久化目录 {}: {e}", data_dir.display());
+            process::exit(2);
+        }
+    };
+    let store = Store {
+        dataset: loaded.dataset,
+        snapshots: loaded
+            .snapshots
+            .into_iter()
+            .map(|s| Snapshot {
+                version: s.version,
+                records: s.records,
+            })
+            .collect(),
+        next_version: loaded.next_version,
+    };
+
     let bind = env::var("VDE_BIND").unwrap_or_else(|_| "127.0.0.1:8080".to_owned());
     let listener = tokio::net::TcpListener::bind(&bind).await?;
     let state = AppState {
-        store: std::sync::Arc::new(Mutex::new(Store::default())),
+        store: std::sync::Arc::new(Mutex::new(store)),
+        data_dir,
     };
     let app = Router::new()
         .route("/health", get(health))
