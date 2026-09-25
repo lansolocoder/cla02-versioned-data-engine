@@ -9,12 +9,15 @@ use axum::{
 use percent_encoding::percent_decode_str;
 use serde::Deserialize;
 use serde::Serialize;
-use serde_json::{Map, Value};
+use serde_json::{Map, Value, json};
 use std::{
     collections::{BTreeMap, HashSet},
     env,
     error::Error,
-    sync::{Mutex, MutexGuard},
+    fs::{self, OpenOptions},
+    io::Write,
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex, MutexGuard},
 };
 
 /// 一条记录的字段集：任意 JSON 对象。
@@ -32,14 +35,132 @@ struct Snapshot {
 #[derive(Default)]
 struct Store {
     dataset: Dataset,
-    /// 已保存快照，下标 0 对应版本 1。
+    /// 已保存快照，按保存顺序排列。
     snapshots: Vec<Snapshot>,
+}
+
+impl Store {
+    /// 下一个版本号：已保存（含恢复）最大版本号加 1。
+    fn next_version(&self) -> u64 {
+        self.snapshots
+            .iter()
+            .map(|s| s.version)
+            .max()
+            .unwrap_or(0)
+            + 1
+    }
+}
+
+/// 追加式持久化日志：每次成功改变持久状态的操作追加一行 JSON 对象。
+///
+/// - 批次写入：每条记录一行 `{"type":"write","key":...,"fields":...}`
+/// - 保存快照：一行 `{"type":"snapshot","version":...,"total":...}`
+///
+/// 日志只追加，不改写历史行；启动时按行序重放恢复数据集与全部快照。
+struct Journal {
+    path: PathBuf,
+}
+
+impl Journal {
+    fn new(dir: &Path) -> Self {
+        Journal {
+            path: dir.join("journal.log"),
+        }
+    }
+
+    /// 把若干行日志原子地追加到日志文件。
+    ///
+    /// 先把整批行序列化到内存缓冲区，再一次写入；若写入失败，
+    /// 把文件截断回写入前的长度，保证不留下半条记录。
+    fn append(&self, lines: &[Value]) -> std::io::Result<()> {
+        if let Some(dir) = self.path.parent() {
+            fs::create_dir_all(dir)?;
+        }
+        let mut buf = Vec::new();
+        for line in lines {
+            serde_json::to_writer(&mut buf, line)?;
+            buf.push(b'\n');
+        }
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)?;
+        let original_len = file.metadata()?.len();
+        if let Err(err) = file.write_all(&buf).and_then(|()| file.flush()) {
+            // 不留半条记录：截断回写入前的长度。
+            let _ = file.set_len(original_len);
+            return Err(err);
+        }
+        Ok(())
+    }
+}
+
+/// 启动时按日志顺序重放，恢复数据集与全部快照。
+///
+/// 返回恢复出的 Store；若某行结构非法，则丢弃自该行起的全部内容，
+/// 保留此前已重放的状态，并返回该行的行号（从 1 计）由调用方报告。
+/// 日志文件或目录不存在等价于空数据集、零快照。
+fn replay_journal(dir: &Path) -> (Store, Option<usize>) {
+    let path = dir.join("journal.log");
+    let content = match fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(_) => return (Store::default(), None),
+    };
+
+    let mut store = Store::default();
+    for (index, line) in content.lines().enumerate() {
+        let line_no = index + 1;
+        match parse_journal_line(line) {
+            Some(JournalEntry::Write { key, fields }) => {
+                store.dataset.insert(key, fields);
+            }
+            Some(JournalEntry::Snapshot { version }) => {
+                // 重放到快照行时，当前数据集即保存时刻的完整状态。
+                let records = store
+                    .dataset
+                    .iter()
+                    .map(|(key, fields)| (key.clone(), Value::Object(fields.clone())))
+                    .collect();
+                store.snapshots.push(Snapshot { version, records });
+            }
+            None => return (store, Some(line_no)),
+        }
+    }
+    (store, None)
+}
+
+enum JournalEntry {
+    Write { key: String, fields: Fields },
+    Snapshot { version: u64 },
+}
+
+/// 解析一行日志；结构非法（非 JSON 对象、type 非法、缺必需字段或字段类型不符）返回 None。
+fn parse_journal_line(line: &str) -> Option<JournalEntry> {
+    let Value::Object(object) = serde_json::from_str::<Value>(line).ok()? else {
+        return None;
+    };
+    match object.get("type")?.as_str()? {
+        "write" => {
+            let key = object.get("key")?.as_str()?.to_owned();
+            let Value::Object(fields) = object.get("fields")?.clone() else {
+                return None;
+            };
+            Some(JournalEntry::Write { key, fields })
+        }
+        "snapshot" => {
+            let version = object.get("version")?.as_u64()?;
+            object.get("total")?.as_u64()?;
+            Some(JournalEntry::Snapshot { version })
+        }
+        _ => None,
+    }
 }
 
 #[derive(Clone)]
 struct AppState {
     /// 所有读写都经过同一把锁，保证批次写入与快照保存对并发交错整体可见。
-    store: std::sync::Arc<Mutex<Store>>,
+    store: Arc<Mutex<Store>>,
+    journal: Arc<Journal>,
 }
 
 #[derive(Serialize)]
@@ -108,6 +229,17 @@ fn bad_request(message: impl Into<String>) -> (StatusCode, Json<ErrorBody>) {
         StatusCode::BAD_REQUEST,
         Json(ErrorBody {
             error: message.into(),
+            index: None,
+        }),
+    )
+}
+
+/// 持久化失败：500，响应体 error 说明原因，内存状态与日志均不改变。
+fn persist_failed(err: std::io::Error) -> (StatusCode, Json<ErrorBody>) {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(ErrorBody {
+            error: format!("持久化日志写入失败: {err}"),
             index: None,
         }),
     )
@@ -211,8 +343,14 @@ async fn write_records(
         batch.push((key, fields));
     }
 
-    // 全部合法：持锁整体覆盖写入。任一条非法都在上面提前返回，数据集保持原状。
+    // 全部合法：先落盘后改内存。日志写入失败则整批不生效，数据集保持原状。
+    let lines: Vec<Value> = batch
+        .iter()
+        .map(|(key, fields)| json!({"type": "write", "key": key, "fields": fields}))
+        .collect();
+
     let mut store = state.store.lock().unwrap();
+    state.journal.append(&lines).map_err(persist_failed)?;
     let written = batch.len();
     for (key, fields) in batch {
         store.dataset.insert(key, fields);
@@ -224,17 +362,24 @@ async fn write_records(
 }
 
 /// POST /versions：把当前数据集固化为不可变快照。
-async fn save_version(State(state): State<AppState>) -> Json<SaveResponse> {
+async fn save_version(
+    State(state): State<AppState>,
+) -> Result<Json<SaveResponse>, (StatusCode, Json<ErrorBody>)> {
     let mut store: MutexGuard<Store> = state.store.lock().unwrap();
-    let version = store.snapshots.len() as u64 + 1;
+    let version = store.next_version();
+    let total = store.dataset.len();
+    // 先落盘：日志写入失败则不产生新快照。
+    state
+        .journal
+        .append(&[json!({"type": "snapshot", "version": version, "total": total})])
+        .map_err(persist_failed)?;
     let records = store
         .dataset
         .iter()
         .map(|(key, fields)| (key.clone(), Value::Object(fields.clone())))
         .collect();
-    let total = store.dataset.len();
     store.snapshots.push(Snapshot { version, records });
-    Json(SaveResponse { version, total })
+    Ok(Json(SaveResponse { version, total }))
 }
 
 /// GET /snapshots?version=N[&key=K]：读取历史快照。
@@ -297,9 +442,18 @@ async fn get_snapshot(
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     let bind = env::var("VDE_BIND").unwrap_or_else(|_| "127.0.0.1:8080".to_owned());
+    // 持久化目录：VDE_DATA_DIR，默认 ./data；日志文件为其下的 journal.log。
+    let data_dir = PathBuf::from(env::var("VDE_DATA_DIR").unwrap_or_else(|_| "./data".to_owned()));
+
+    let (store, discarded_from) = replay_journal(&data_dir);
+    if let Some(line_no) = discarded_from {
+        println!("持久化日志自第 {line_no} 行起结构非法，已丢弃该行及后续全部内容");
+    }
+
     let listener = tokio::net::TcpListener::bind(&bind).await?;
     let state = AppState {
-        store: std::sync::Arc::new(Mutex::new(Store::default())),
+        store: Arc::new(Mutex::new(store)),
+        journal: Arc::new(Journal::new(&data_dir)),
     };
     let app = Router::new()
         .route("/health", get(health))
