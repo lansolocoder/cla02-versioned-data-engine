@@ -14,7 +14,7 @@ use std::{
     collections::{BTreeMap, HashSet},
     env,
     error::Error,
-    sync::{Mutex, MutexGuard},
+    sync::{Arc, Mutex, MutexGuard},
 };
 
 /// 一条记录的字段集：任意 JSON 对象。
@@ -39,7 +39,193 @@ struct Store {
 #[derive(Clone)]
 struct AppState {
     /// 所有读写都经过同一把锁，保证批次写入与快照保存对并发交错整体可见。
-    store: std::sync::Arc<Mutex<Store>>,
+    store: Arc<Mutex<Store>>,
+    /// 持久化目录；未设置 VDE_DATA_DIR 时为 None，服务纯内存运行。
+    persistence: Option<Arc<persist::Persistence>>,
+}
+
+/// 磁盘持久化：数据集与快照的原子落盘、启动恢复与目录独占锁。
+mod persist {
+    use super::{Dataset, Snapshot};
+    use serde::{Deserialize, Serialize};
+    use serde_json::Value;
+    use std::{
+        collections::BTreeMap,
+        fmt,
+        fs::{self, File, OpenOptions},
+        io::{self, Write},
+        path::{Path, PathBuf},
+    };
+
+    const DATASET_FILE: &str = "dataset.json";
+    const LOCK_FILE: &str = "vde.lock";
+    const SNAPSHOT_PREFIX: &str = "snapshot-";
+    const SNAPSHOT_SUFFIX: &str = ".json";
+
+    /// 快照文件的磁盘格式。
+    #[derive(Serialize, Deserialize)]
+    struct SnapshotFile {
+        version: u64,
+        records: BTreeMap<String, Value>,
+    }
+
+    /// 打开持久化目录失败的原因。任何情况下调用方都拒绝启动且不改动目录内容。
+    pub enum OpenError {
+        /// 目录不可创建、不可读写等系统错误。
+        Io(io::Error),
+        /// 目录已被其他运行中的实例锁定。
+        Locked(PathBuf),
+        /// 目录中数据损坏或格式无法解析。
+        Corrupt(String),
+    }
+
+    impl fmt::Display for OpenError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                OpenError::Io(e) => write!(f, "持久化目录不可用: {e}"),
+                OpenError::Locked(dir) => {
+                    write!(f, "持久化目录已被其他运行中的实例占用: {}", dir.display())
+                }
+                OpenError::Corrupt(msg) => write!(f, "持久化数据损坏: {msg}"),
+            }
+        }
+    }
+
+    impl From<io::Error> for OpenError {
+        fn from(e: io::Error) -> Self {
+            OpenError::Io(e)
+        }
+    }
+
+    /// 持有目录锁的持久化句柄；锁文件在进程退出时由操作系统自动释放。
+    pub struct Persistence {
+        dir: PathBuf,
+        _lock: File,
+    }
+
+    impl Persistence {
+        /// 打开（必要时创建）持久化目录，获取独占锁，并完整加载、校验已有数据。
+        /// 校验失败或目录被占用时返回错误，调用方必须拒绝启动；
+        /// 此函数不写入除锁文件外的任何内容，且锁文件不会截断已有数据。
+        pub fn open(dir: PathBuf) -> Result<(Self, Dataset, Vec<Snapshot>), OpenError> {
+            if !dir.exists() {
+                fs::create_dir_all(&dir)?;
+            }
+            if !dir.is_dir() {
+                return Err(OpenError::Corrupt(format!(
+                    "持久化路径不是目录: {}",
+                    dir.display()
+                )));
+            }
+
+            // 先取锁再读数据，防止两个实例同时启动时交错读写。
+            let lock_path = dir.join(LOCK_FILE);
+            let lock = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&lock_path)?;
+            lock.try_lock().map_err(|e| match e {
+                std::fs::TryLockError::WouldBlock => OpenError::Locked(dir.clone()),
+                std::fs::TryLockError::Error(io) => OpenError::Io(io),
+            })?;
+
+            let dataset = load_dataset(&dir)?;
+            let snapshots = load_snapshots(&dir)?;
+            Ok((Persistence { dir, _lock: lock }, dataset, snapshots))
+        }
+
+        /// 把当前数据集整体原子替换到磁盘（写批次成功后调用）。
+        pub fn save_dataset(&self, dataset: &Dataset) -> io::Result<()> {
+            let bytes = serde_json::to_vec(dataset)?;
+            atomic_write(&self.dir, DATASET_FILE, &bytes)
+        }
+
+        /// 把一份新快照原子落盘（保存版本时调用）。成功后该文件不可变。
+        pub fn save_snapshot(&self, snapshot: &Snapshot) -> io::Result<()> {
+            let file = SnapshotFile {
+                version: snapshot.version,
+                records: snapshot.records.clone(),
+            };
+            let bytes = serde_json::to_vec(&file)?;
+            atomic_write(
+                &self.dir,
+                &format!("{SNAPSHOT_PREFIX}{}{SNAPSHOT_SUFFIX}", snapshot.version),
+                &bytes,
+            )
+        }
+    }
+
+    /// 原子写入：先写临时文件并 fsync，再 rename 覆盖目标，最后 fsync 目录。
+    /// 进程在任意时刻被强杀，目标文件要么保持旧内容、要么是完整的新内容；
+    /// 可能残留的临时文件在启动时被忽略。
+    fn atomic_write(dir: &Path, name: &str, bytes: &[u8]) -> io::Result<()> {
+        let tmp_path = dir.join(format!("{name}.tmp"));
+        {
+            let mut tmp = File::create(&tmp_path)?;
+            tmp.write_all(bytes)?;
+            tmp.sync_all()?;
+        }
+        fs::rename(&tmp_path, dir.join(name))?;
+        File::open(dir)?.sync_all()?;
+        Ok(())
+    }
+
+    /// 读取当前数据集；文件不存在视为空数据集（全新目录）。
+    fn load_dataset(dir: &Path) -> Result<Dataset, OpenError> {
+        let path = dir.join(DATASET_FILE);
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Dataset::new()),
+            Err(e) => return Err(OpenError::Io(e)),
+        };
+        serde_json::from_slice(&bytes)
+            .map_err(|e| OpenError::Corrupt(format!("{DATASET_FILE} 无法解析: {e}")))
+    }
+
+    /// 读取全部快照文件，并校验版本号与文件名一致、从 1 开始严格连续。
+    fn load_snapshots(dir: &Path) -> Result<Vec<Snapshot>, OpenError> {
+        let mut snapshots = Vec::new();
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            let Some(rest) = name.strip_prefix(SNAPSHOT_PREFIX) else {
+                continue;
+            };
+            let Some(number) = rest.strip_suffix(SNAPSHOT_SUFFIX) else {
+                continue;
+            };
+            let file_version: u64 = number
+                .parse()
+                .map_err(|_| OpenError::Corrupt(format!("快照文件名非法: {name}")))?;
+            let bytes = fs::read(entry.path())?;
+            let file: SnapshotFile = serde_json::from_slice(&bytes)
+                .map_err(|e| OpenError::Corrupt(format!("快照文件 {name} 无法解析: {e}")))?;
+            if file.version != file_version {
+                return Err(OpenError::Corrupt(format!(
+                    "快照文件 {name} 内版本号 {} 与文件名不符",
+                    file.version
+                )));
+            }
+            snapshots.push(Snapshot {
+                version: file.version,
+                records: file.records,
+            });
+        }
+        snapshots.sort_by_key(|s| s.version);
+        for (index, snapshot) in snapshots.iter().enumerate() {
+            let expected = index as u64 + 1;
+            if snapshot.version != expected {
+                return Err(OpenError::Corrupt(format!(
+                    "快照版本不连续: 期望 {expected}, 实际 {}",
+                    snapshot.version
+                )));
+            }
+        }
+        Ok(snapshots)
+    }
 }
 
 #[derive(Serialize)]
@@ -106,6 +292,17 @@ struct ErrorBody {
 fn bad_request(message: impl Into<String>) -> (StatusCode, Json<ErrorBody>) {
     (
         StatusCode::BAD_REQUEST,
+        Json(ErrorBody {
+            error: message.into(),
+            index: None,
+        }),
+    )
+}
+
+/// 持久化失败：磁盘错误不属于请求问题，返回 500，内存状态保持不变。
+fn persist_failure(message: impl Into<String>) -> (StatusCode, Json<ErrorBody>) {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
         Json(ErrorBody {
             error: message.into(),
             index: None,
@@ -214,8 +411,20 @@ async fn write_records(
     // 全部合法：持锁整体覆盖写入。任一条非法都在上面提前返回，数据集保持原状。
     let mut store = state.store.lock().unwrap();
     let written = batch.len();
-    for (key, fields) in batch {
-        store.dataset.insert(key, fields);
+    if let Some(persistence) = &state.persistence {
+        // 先落盘后改内存：落盘失败时内存状态不变，客户端可安全重试。
+        let mut next = store.dataset.clone();
+        for (key, fields) in batch {
+            next.insert(key, fields);
+        }
+        persistence
+            .save_dataset(&next)
+            .map_err(|e| persist_failure(format!("数据集持久化失败: {e}")))?;
+        store.dataset = next;
+    } else {
+        for (key, fields) in batch {
+            store.dataset.insert(key, fields);
+        }
     }
     Ok(Json(WriteResponse {
         written,
@@ -224,7 +433,9 @@ async fn write_records(
 }
 
 /// POST /versions：把当前数据集固化为不可变快照。
-async fn save_version(State(state): State<AppState>) -> Json<SaveResponse> {
+async fn save_version(
+    State(state): State<AppState>,
+) -> Result<Json<SaveResponse>, (StatusCode, Json<ErrorBody>)> {
     let mut store: MutexGuard<Store> = state.store.lock().unwrap();
     let version = store.snapshots.len() as u64 + 1;
     let records = store
@@ -232,9 +443,16 @@ async fn save_version(State(state): State<AppState>) -> Json<SaveResponse> {
         .iter()
         .map(|(key, fields)| (key.clone(), Value::Object(fields.clone())))
         .collect();
+    let snapshot = Snapshot { version, records };
+    if let Some(persistence) = &state.persistence {
+        // 原子落盘成功后才推进内存中的版本号；失败或崩溃都不会产生半截快照或跳号。
+        persistence
+            .save_snapshot(&snapshot)
+            .map_err(|e| persist_failure(format!("快照持久化失败: {e}")))?;
+    }
     let total = store.dataset.len();
-    store.snapshots.push(Snapshot { version, records });
-    Json(SaveResponse { version, total })
+    store.snapshots.push(snapshot);
+    Ok(Json(SaveResponse { version, total }))
 }
 
 /// GET /snapshots?version=N[&key=K]：读取历史快照。
@@ -296,10 +514,33 @@ async fn get_snapshot(
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
+    // 先完成持久化目录的锁定与数据恢复，再绑定端口；
+    // 恢复失败时拒绝启动，不持有端口也不写任何数据。
+    let (store, persistence) = match env::var_os("VDE_DATA_DIR") {
+        Some(dir) => match persist::Persistence::open(dir.into()) {
+            Ok((persistence, dataset, snapshots)) => {
+                let versions = snapshots.len();
+                if versions > 0 {
+                    println!(
+                        "已从持久化目录恢复 {} 条记录、{versions} 份快照",
+                        dataset.len()
+                    );
+                }
+                (Store { dataset, snapshots }, Some(Arc::new(persistence)))
+            }
+            Err(e) => {
+                eprintln!("无法启动: {e}");
+                std::process::exit(1);
+            }
+        },
+        None => (Store::default(), None),
+    };
+
     let bind = env::var("VDE_BIND").unwrap_or_else(|_| "127.0.0.1:8080".to_owned());
     let listener = tokio::net::TcpListener::bind(&bind).await?;
     let state = AppState {
-        store: std::sync::Arc::new(Mutex::new(Store::default())),
+        store: Arc::new(Mutex::new(store)),
+        persistence,
     };
     let app = Router::new()
         .route("/health", get(health))
