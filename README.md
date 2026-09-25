@@ -20,6 +20,7 @@ VDE_BIND=127.0.0.1:8080 cargo run --locked
 | `/datasets/records` | POST | 批量写入记录 |
 | `/versions` | POST | 保存当前数据集为不可变快照 |
 | `/snapshots?version=N[&key=K]` | GET | 读取历史快照（全部记录或单个键） |
+| `/snapshots/diff?from=N&to=M` | GET | 比较两份快照的记录级变化 |
 
 ### GET /health
 
@@ -82,6 +83,33 @@ curl -s 'http://127.0.0.1:8080/snapshots?version=1&key=alpha'
 
 curl -s 'http://127.0.0.1:8080/snapshots?version=9'
 # 404 {"error":"版本 9 不存在或尚未保存"}
+```
+
+### GET /snapshots/diff
+
+比较两份已保存快照，返回记录级变化。`from` 与 `to` 均为必选的正整数版本号；`from` 与 `to` 相等也合法，此时所有记录均为 `unchanged`。
+
+- 响应为 JSON 对象：`from`、`to`（数字）与 `changes` 数组。`changes` 覆盖两份快照键的并集，按键的字典序升序排列；每项含 `key`、`change`（`added` / `removed` / `modified` / `unchanged` 之一）与 `fields`：
+  - `added`（仅 `to` 侧存在）：`fields` 为 `to` 侧该记录的字段集；
+  - `removed`（仅 `from` 侧存在）：`fields` 为 `from` 侧该记录的字段集；
+  - `modified`（两侧都有但字段集不同）：`fields` 为 `{"from":<from 侧字段集>,"to":<to 侧字段集>}`；
+  - `unchanged`（两侧字段集逐字段完全相同）：`fields` 为 `null`。
+- 字段集比较按 JSON 值语义，对象内字段顺序不影响结果。
+- `from` 或 `to` 指向尚未保存的版本时返回 `404`；缺少任一参数或参数不是正整数时返回 `400`。失败响应均为含 `error` 字段的 JSON 对象，且不会创建或修改任何快照。
+- 比较是只读操作：不消耗或推进版本号，也不改变当前数据集与已保存快照。
+
+```sh
+curl -s 'http://127.0.0.1:8080/snapshots/diff?from=1&to=2'
+# {"from":1,"to":2,"changes":[
+#   {"key":"alpha","change":"modified","fields":{"from":{"n":1},"to":{"n":10}}},
+#   {"key":"bravo","change":"unchanged","fields":null},
+#   {"key":"charlie","change":"added","fields":{"n":3}}]}
+
+curl -s 'http://127.0.0.1:8080/snapshots/diff?from=1&to=9'
+# 404 {"error":"版本 9 不存在或尚未保存"}
+
+curl -s 'http://127.0.0.1:8080/snapshots/diff?from=1'
+# 400 {"error":"缺少必填查询参数 to"}
 ```
 
 ## 并发语义
