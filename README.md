@@ -15,6 +15,7 @@ VDE_BIND=127.0.0.1:8080 cargo run --locked
 | --- | --- |
 | `GET /health` | `{"status":"ok"}` |
 | `GET /version` | `{"name":"versioned-data-engine","version":"0.1.0"}` |
+| `GET /datasets/{name}/records` | 200 `{"name":<数据集名>,"records":[{"key":<key>,"value":<JSON 值>,"updatedAt":<RFC3339 UTC>},...]}`，records 按 key 的 Unicode 码点升序；400 `{"error":"invalid_identifier"}` / `{"error":"invalid_query"}`，404 `{"error":"not_found"}`，500 `{"error":"internal"}` |
 
 ```sh
 curl http://127.0.0.1:8080/health

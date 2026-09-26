@@ -2,7 +2,7 @@ use axum::{
     Json, Router,
     body::Bytes,
     extract::{Path, State},
-    http::StatusCode,
+    http::{StatusCode, Uri},
     response::{IntoResponse, Response},
     routing::{get, put},
 };
@@ -16,6 +16,7 @@ use std::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
+    time::SystemTime,
 };
 
 #[derive(Serialize)]
@@ -159,6 +160,111 @@ async fn get_record(
     }
 }
 
+/// Format a timestamp as RFC3339 UTC with second precision, e.g.
+/// `2006-01-02T15:04:05Z`. Civil-from-days conversion per Howard Hinnant.
+fn format_rfc3339_utc(t: SystemTime) -> String {
+    let secs = t
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let days = (secs / 86400) as i64;
+    let sod = secs % 86400;
+    let (hour, min, sec) = (sod / 3600, (sod % 3600) / 60, sod % 60);
+
+    let z = days + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = (z - era * 146097) as u64; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365; // [0, 399]
+    let year = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let day = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
+    let month = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
+    let year = if month <= 2 { year + 1 } else { year };
+
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{min:02}:{sec:02}Z")
+}
+
+async fn list_records(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    uri: Uri,
+) -> Response {
+    if !valid_identifier(&name) {
+        return error_response(StatusCode::BAD_REQUEST, "invalid_identifier");
+    }
+    if uri.query().is_some_and(|q| !q.is_empty()) {
+        return error_response(StatusCode::BAD_REQUEST, "invalid_query");
+    }
+
+    let dir = state.data_dir.join(&name);
+    let mut entries = match tokio::fs::read_dir(&dir).await {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return error_response(StatusCode::NOT_FOUND, "not_found");
+        }
+        Err(e) => {
+            tracing_error(&e);
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal");
+        }
+    };
+
+    let mut records: Vec<(String, Value, SystemTime)> = Vec::new();
+    loop {
+        let entry = match entries.next_entry().await {
+            Ok(Some(entry)) => entry,
+            Ok(None) => break,
+            Err(e) => {
+                tracing_error(&e);
+                return error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal");
+            }
+        };
+        let file_name = entry.file_name();
+        let Some(file_name) = file_name.to_str() else {
+            continue;
+        };
+        let Some(key) = file_name.strip_suffix(".json") else {
+            continue;
+        };
+
+        let result = async {
+            let bytes = tokio::fs::read(entry.path()).await?;
+            let modified = entry.metadata().await?.modified()?;
+            Ok::<(Vec<u8>, SystemTime), std::io::Error>((bytes, modified))
+        }
+        .await;
+        let (bytes, modified) = match result {
+            Ok(ok) => ok,
+            Err(e) => {
+                tracing_error(&e);
+                return error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal");
+            }
+        };
+        let value: Value = match serde_json::from_slice(&bytes) {
+            Ok(value) => value,
+            Err(e) => {
+                eprintln!("corrupt record {name}/{key}: {e}");
+                return error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal");
+            }
+        };
+        records.push((key.to_owned(), value, modified));
+    }
+
+    // Byte-wise order on UTF-8 is Unicode code-point order.
+    records.sort_by(|a, b| a.0.cmp(&b.0));
+    let records: Vec<Value> = records
+        .into_iter()
+        .map(|(key, value, modified)| {
+            json!({
+                "key": key,
+                "value": value,
+                "updatedAt": format_rfc3339_utc(modified),
+            })
+        })
+        .collect();
+    Json(json!({ "name": name, "records": records })).into_response()
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     let bind = env::var("VDE_BIND").unwrap_or_else(|_| "127.0.0.1:8080".to_owned());
@@ -177,6 +283,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             "/datasets/{name}/records/{key}",
             put(put_record).get(get_record),
         )
+        .route("/datasets/{name}/records", get(list_records))
         .with_state(state);
 
     println!("Listening on http://{}", listener.local_addr()?);
