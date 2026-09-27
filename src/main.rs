@@ -6,7 +6,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, put},
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     collections::{HashMap, HashSet},
@@ -235,7 +235,7 @@ fn format_rfc3339_utc(t: SystemTime) -> String {
 /// Key-only filter for record listing, parsed from the query string.
 /// Either a prefix match, or a lower/upper bound range (each bound
 /// inclusive or exclusive), but never both.
-#[derive(Default)]
+#[derive(Clone, Default, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct KeyFilter {
     prefix: Option<String>,
     /// (bound, inclusive)
@@ -271,6 +271,129 @@ impl KeyFilter {
         }
         true
     }
+}
+
+/// Opaque, self-contained continuation token for a paged list. It pins the
+/// exact filter the page was issued under and the last key returned, so the
+/// next request resumes strictly after that key in code-point order.
+/// Keyset positioning (rather than an offset) is what keeps paging stable
+/// under concurrent writes: records inserted into already-served positions
+/// are never revisited, and deleted records leave no gap.
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct Cursor {
+    /// Filter the cursor was minted for; must match the current request.
+    filter: KeyFilter,
+    /// Last key of the preceding page; resume strictly after it.
+    after: String,
+}
+
+const B64URL_CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+
+/// Encode bytes as unpadded base64url; output contains only
+/// `[A-Za-z0-9_-]`.
+fn base64url_encode(input: &[u8]) -> String {
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+    for chunk in input.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
+        let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
+        let triple = (b0 << 16) | (b1 << 8) | b2;
+        out.push(B64URL_CHARS[((triple >> 18) & 0x3f) as usize] as char);
+        out.push(B64URL_CHARS[((triple >> 12) & 0x3f) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(B64URL_CHARS[((triple >> 6) & 0x3f) as usize] as char);
+        }
+        if chunk.len() > 2 {
+            out.push(B64URL_CHARS[(triple & 0x3f) as usize] as char);
+        }
+    }
+    out
+}
+
+/// Decode unpadded base64url. Only `[A-Za-z0-9_-]` characters are accepted
+/// (padding and any other byte are rejected); a dangling final quantum is
+/// rejected.
+fn base64url_decode(input: &str) -> Option<Vec<u8>> {
+    let bytes = input.as_bytes();
+    if bytes.is_empty() {
+        return Some(Vec::new());
+    }
+    let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
+    let decode6 = |c: u8| -> Option<u32> {
+        match c {
+            b'A'..=b'Z' => Some((c - b'A') as u32),
+            b'a'..=b'z' => Some((c - b'a' + 26) as u32),
+            b'0'..=b'9' => Some((c - b'0' + 52) as u32),
+            b'-' => Some(62),
+            b'_' => Some(63),
+            _ => None,
+        }
+    };
+    let (chunks, rem) = bytes.as_chunks::<4>();
+    for chunk in chunks {
+        let n0 = decode6(chunk[0])?;
+        let n1 = decode6(chunk[1])?;
+        let n2 = decode6(chunk[2])?;
+        let n3 = decode6(chunk[3])?;
+        let triple = (n0 << 18) | (n1 << 12) | (n2 << 6) | n3;
+        out.push((triple >> 16) as u8);
+        out.push((triple >> 8) as u8);
+        out.push(triple as u8);
+    }
+    // One leftover char carries no byte; two carry one, three carry two.
+    match rem.len() {
+        0 => {}
+        2 => {
+            let n0 = decode6(rem[0])?;
+            let n1 = decode6(rem[1])?;
+            let triple = (n0 << 18) | (n1 << 12);
+            out.push((triple >> 16) as u8);
+        }
+        3 => {
+            let n0 = decode6(rem[0])?;
+            let n1 = decode6(rem[1])?;
+            let n2 = decode6(rem[2])?;
+            let triple = (n0 << 18) | (n1 << 12) | (n2 << 6);
+            out.push((triple >> 16) as u8);
+            out.push((triple >> 8) as u8);
+        }
+        _ => return None,
+    }
+    Some(out)
+}
+
+/// Serialize a continuation cursor to its opaque token form.
+fn encode_cursor(cursor: &Cursor) -> Option<String> {
+    let json = serde_json::to_vec(cursor).ok()?;
+    Some(base64url_encode(&json))
+}
+
+/// Parse an opaque continuation token. Any structural, encoding, or
+/// semantic failure (including an empty `after`) yields an error that the
+/// caller maps to `invalid_query`.
+fn decode_cursor(token: &str) -> Result<Cursor, ()> {
+    let raw = base64url_decode(token).ok_or(())?;
+    let cursor: Cursor = serde_json::from_slice(&raw).map_err(|_| ())?;
+    if !valid_identifier(&cursor.after) {
+        return Err(());
+    }
+    // Sanity-check the embedded bounds the same way query parsing does.
+    if let Some((bound, _)) = &cursor.filter.lower
+        && !valid_identifier(bound)
+    {
+        return Err(());
+    }
+    if let Some((bound, _)) = &cursor.filter.upper
+        && !valid_identifier(bound)
+    {
+        return Err(());
+    }
+    if let Some(prefix) = &cursor.filter.prefix
+        && !valid_identifier(prefix)
+    {
+        return Err(());
+    }
+    Ok(cursor)
 }
 
 fn hex_val(b: u8) -> Option<u8> {
@@ -311,39 +434,93 @@ fn percent_decode(s: &str) -> Result<String, ()> {
     String::from_utf8(out).map_err(|_| ())
 }
 
-/// Parse the query string into a key filter. Any parameter outside the
-/// documented set (`prefix`, `gte`, `gt`, `lte`, `lt`), duplicates,
-/// conflicting bounds, or values that are not valid key fragments
-/// (non-empty, `[A-Za-z0-9_-]`) are rejected.
-fn parse_key_filter(query: &str) -> Result<KeyFilter, ()> {
+/// Maximum page size accepted by the list endpoint.
+const MAX_LIMIT: usize = 1000;
+
+/// Parsed list query: the key filter plus optional keyset pagination.
+struct ListQuery {
+    filter: KeyFilter,
+    limit: Option<usize>,
+    /// Raw continuation token, already validated as non-empty and
+    /// `[A-Za-z0-9_-]`-only; decoded later against the current filter.
+    cursor: Option<String>,
+}
+
+/// Parse the query string into a key filter and pagination parameters. Any
+/// parameter outside the documented set (`prefix`, `gte`, `gt`, `lte`,
+/// `lt`, `limit`, `cursor`), duplicates, conflicting bounds, values that are
+/// not valid key fragments (non-empty, `[A-Za-z0-9_-]`), a `limit` outside
+/// 1..=1000, or an empty/illegal `cursor` are rejected.
+fn parse_list_query(query: &str) -> Result<ListQuery, ()> {
     let mut filter = KeyFilter::default();
     if query.is_empty() {
-        return Ok(filter);
+        return Ok(ListQuery {
+            filter,
+            limit: None,
+            cursor: None,
+        });
     }
     let mut gte: Option<String> = None;
     let mut gt: Option<String> = None;
     let mut lte: Option<String> = None;
     let mut lt: Option<String> = None;
+    let mut limit: Option<usize> = None;
+    let mut cursor: Option<String> = None;
 
     for pair in query.split('&') {
         let (raw_name, raw_value) = pair.split_once('=').ok_or(())?;
         let name = percent_decode(raw_name)?;
         let value = percent_decode(raw_value)?;
-        if !valid_identifier(&value) {
-            return Err(());
-        }
-        let slot = match name.as_str() {
-            "prefix" => &mut filter.prefix,
-            "gte" => &mut gte,
-            "gt" => &mut gt,
-            "lte" => &mut lte,
-            "lt" => &mut lt,
+        match name.as_str() {
+            "limit" => {
+                // Strict decimal integer: digits only, no sign or other
+                // characters; range-checked to 1..=1000 below.
+                if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+                    return Err(());
+                }
+                let parsed: usize = value.parse().map_err(|_| ())?;
+                if !(1..=MAX_LIMIT).contains(&parsed) {
+                    return Err(());
+                }
+                if limit.is_some() {
+                    return Err(());
+                }
+                limit = Some(parsed);
+            }
+            "cursor" => {
+                // Non-empty, opaque, charset-restricted. Full structural
+                // validation happens once the current filter is known.
+                if value.is_empty()
+                    || !value
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+                {
+                    return Err(());
+                }
+                if cursor.is_some() {
+                    return Err(());
+                }
+                cursor = Some(value);
+            }
+            "prefix" | "gte" | "gt" | "lte" | "lt" => {
+                if !valid_identifier(&value) {
+                    return Err(());
+                }
+                let slot = match name.as_str() {
+                    "prefix" => &mut filter.prefix,
+                    "gte" => &mut gte,
+                    "gt" => &mut gt,
+                    "lte" => &mut lte,
+                    "lt" => &mut lt,
+                    _ => unreachable!(),
+                };
+                if slot.is_some() {
+                    return Err(());
+                }
+                *slot = Some(value);
+            }
             _ => return Err(()),
-        };
-        if slot.is_some() {
-            return Err(());
         }
-        *slot = Some(value);
     }
 
     if filter.prefix.is_some() && (gte.is_some() || gt.is_some() || lte.is_some() || lt.is_some()) {
@@ -357,7 +534,11 @@ fn parse_key_filter(query: &str) -> Result<KeyFilter, ()> {
     }
     filter.lower = gte.map(|b| (b, true)).or_else(|| gt.map(|b| (b, false)));
     filter.upper = lte.map(|b| (b, true)).or_else(|| lt.map(|b| (b, false)));
-    Ok(filter)
+    Ok(ListQuery {
+        filter,
+        limit,
+        cursor,
+    })
 }
 
 async fn list_records(
@@ -368,9 +549,20 @@ async fn list_records(
     if !valid_identifier(&name) {
         return error_response(StatusCode::BAD_REQUEST, "invalid_identifier");
     }
-    let filter = match parse_key_filter(uri.query().unwrap_or("")) {
-        Ok(filter) => filter,
+    let query = match parse_list_query(uri.query().unwrap_or("")) {
+        Ok(query) => query,
         Err(()) => return error_response(StatusCode::BAD_REQUEST, "invalid_query"),
+    };
+
+    // A continuation token is accepted only when it decodes and pins the
+    // exact filter of this request; it then marks the resume position.
+    let after: Option<String> = match query.cursor.as_deref() {
+        None => None,
+        Some(token) => match decode_cursor(token) {
+            Ok(cursor) if cursor.filter == query.filter => Some(cursor.after),
+            // Corrupt token, unparseable payload, or filter mismatch.
+            _ => return error_response(StatusCode::BAD_REQUEST, "invalid_query"),
+        },
     };
 
     // Shared guard across the whole scan: commits rename files one by one,
@@ -408,7 +600,7 @@ async fn list_records(
         };
         // Filter on the key alone, before reading: records outside the hit
         // set are excluded even if their file is corrupt or unreadable.
-        if !filter.matches(key) {
+        if !query.filter.matches(key) {
             continue;
         }
 
@@ -437,17 +629,74 @@ async fn list_records(
 
     // Byte-wise order on UTF-8 is Unicode code-point order.
     records.sort_by(|a, b| a.0.cmp(&b.0));
-    let records: Vec<Value> = records
-        .into_iter()
+
+    // Keyset resume: drop everything up to and including `after`. Position
+    // is derived from the key order rather than an offset, so records
+    // inserted behind the cursor are simply never revisited and deleted
+    // positions leave no gap.
+    let mut start = 0usize;
+    if let Some(after) = &after {
+        // A genuine cursor always names a record the preceding page
+        // returned: it must lie inside the current filter's hit set, exist
+        // exactly in it, and have a non-empty tail (nextCursor is only ever
+        // minted while more records remain). Anything else is a forged,
+        // corrupt, or out-of-bounds token.
+        if !query.filter.matches(after) {
+            return error_response(StatusCode::BAD_REQUEST, "invalid_query");
+        }
+        // First index whose key is strictly greater than `after`.
+        start = records.partition_point(|(key, _, _)| key.as_str() <= after.as_str());
+        let points_at_real_record = start > 0
+            && records
+                .get(start - 1)
+                .is_some_and(|(key, _, _)| key == after);
+        if !points_at_real_record || start >= records.len() {
+            return error_response(StatusCode::BAD_REQUEST, "invalid_query");
+        }
+    }
+
+    let total = records.len();
+    let end = match query.limit {
+        Some(limit) => (start + limit).min(total),
+        None => total,
+    };
+
+    let mut next_cursor: Option<String> = None;
+    if let Some(limit) = query.limit
+        && start + limit < total
+    {
+        let last_key = &records[end - 1].0;
+        // A cursor that cannot be minted is an internal failure, not a
+        // client error: fail the whole request rather than return a
+        // unpageable slice.
+        let token = match encode_cursor(&Cursor {
+            filter: query.filter.clone(),
+            after: last_key.clone(),
+        }) {
+            Some(token) => token,
+            None => return error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal"),
+        };
+        next_cursor = Some(token);
+    }
+
+    let page: Vec<Value> = records[start..end]
+        .iter()
         .map(|(key, value, modified)| {
             json!({
                 "key": key,
                 "value": value,
-                "updatedAt": format_rfc3339_utc(modified),
+                "updatedAt": format_rfc3339_utc(*modified),
             })
         })
         .collect();
-    Json(json!({ "name": name, "records": records })).into_response()
+
+    // Legacy response shape (no limit, no cursor) carries exactly the two
+    // fields; paged responses add nextCursor only while a tail remains.
+    let mut body = json!({ "name": name, "records": page });
+    if let Some(token) = next_cursor {
+        body["nextCursor"] = Value::String(token);
+    }
+    Json(body).into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -1031,4 +1280,111 @@ async fn main() -> Result<(), Box<dyn Error>> {
         })
         .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn base64url_round_trip() {
+        // Include every length mod 3 so every padding path is exercised.
+        for payload in [
+            Vec::new(),
+            vec![0x00],
+            vec![0x00, 0x01],
+            vec![0x00, 0x01, 0x02],
+            (0u8..=255).collect(),
+            serde_json::to_vec("héllo—🚀").unwrap(),
+        ] {
+            let token = base64url_encode(&payload);
+            assert!(
+                token
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-'),
+                "token must stay within [A-Za-z0-9_-]"
+            );
+            assert!(!token.contains('='));
+            assert_eq!(
+                base64url_decode(&token).as_deref(),
+                Some(payload.as_slice())
+            );
+        }
+    }
+
+    #[test]
+    fn base64url_rejects_garbage() {
+        // Padding, illegal alphabet, and dangling one-char quanta.
+        for bad in ["=", "AB==", "abc!", "ab*", "a", "abcde=", "++//", " "] {
+            assert!(base64url_decode(bad).is_none(), "should reject {bad:?}");
+        }
+    }
+
+    #[test]
+    fn cursor_round_trip() {
+        let cursor = Cursor {
+            filter: KeyFilter {
+                prefix: Some("user-".to_owned()),
+                lower: None,
+                upper: Some(("z".to_owned(), false)),
+            },
+            after: "user-42".to_owned(),
+        };
+        let token = encode_cursor(&cursor).unwrap();
+        assert_eq!(decode_cursor(&token).unwrap(), cursor);
+    }
+
+    #[test]
+    fn cursor_rejects_bad_payloads() {
+        // Empty `after`, illegal embedded fragments, non-JSON tokens.
+        assert!(decode_cursor("AAAA").is_err());
+        let empty_after = encode_cursor(&Cursor {
+            filter: KeyFilter::default(),
+            after: String::new(),
+        })
+        .unwrap();
+        assert!(decode_cursor(&empty_after).is_err());
+    }
+
+    #[test]
+    fn list_query_accepts() {
+        let q = parse_list_query("prefix=user-&limit=50").unwrap();
+        assert_eq!(q.limit, Some(50));
+        assert_eq!(q.filter.prefix.as_deref(), Some("user-"));
+        assert!(q.cursor.is_none());
+
+        let q = parse_list_query("gte=a&lt=z&limit=1000&cursor=Abc_-9").unwrap();
+        assert_eq!(q.limit, Some(1000));
+        assert_eq!(q.filter.lower, Some(("a".to_owned(), true)));
+        assert_eq!(q.filter.upper, Some(("z".to_owned(), false)));
+        assert_eq!(q.cursor.as_deref(), Some("Abc_-9"));
+
+        // No params preserves the legacy full-list request.
+        let q = parse_list_query("").unwrap();
+        assert!(q.limit.is_none() && q.cursor.is_none());
+    }
+
+    #[test]
+    fn list_query_rejects() {
+        let bad = [
+            "limit=0",
+            "limit=1001",
+            "limit=-5",
+            "limit=abc",
+            "limit=1&limit=2",
+            "limit=99999999999999999999",
+            "cursor=",
+            "cursor=bad.token",
+            "cursor=a&cursor=b",
+            "unknown=1",
+            "prefix=p&gte=a",
+            "gte=a&gt=b",
+            "lte=a&lt=b",
+            "prefix=",
+            "limit=",
+        ];
+        for case in bad {
+            assert!(parse_list_query(case).is_err(), "should reject {case:?}");
+        }
+    }
 }
