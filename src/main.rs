@@ -311,15 +311,43 @@ fn percent_decode(s: &str) -> Result<String, ()> {
     String::from_utf8(out).map_err(|_| ())
 }
 
-/// Parse the query string into a key filter. Any parameter outside the
-/// documented set (`prefix`, `gte`, `gt`, `lte`, `lt`), duplicates,
-/// conflicting bounds, or values that are not valid key fragments
-/// (non-empty, `[A-Za-z0-9_-]`) are rejected.
-fn parse_key_filter(query: &str) -> Result<KeyFilter, ()> {
-    let mut filter = KeyFilter::default();
-    if query.is_empty() {
-        return Ok(filter);
+/// Parsed query string for record listing: the key filter plus optional
+/// key-ordered pagination (`limit`/`cursor`).
+#[derive(Default)]
+struct ListQuery {
+    filter: KeyFilter,
+    /// Maximum number of records per page (1..=1000).
+    limit: Option<usize>,
+    /// Continuation token from a previous page: the key after which this
+    /// page starts. Opaque to clients; currently the last key of the
+    /// previous page, which already satisfies the token charset.
+    cursor: Option<String>,
+}
+
+/// Parse a `limit` value: a decimal integer in 1..=1000, digits only.
+fn parse_limit(value: &str) -> Result<usize, ()> {
+    if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(());
     }
+    let n: u64 = value.parse().map_err(|_| ())?;
+    if !(1..=1000).contains(&n) {
+        return Err(());
+    }
+    Ok(n as usize)
+}
+
+/// Parse the query string into a key filter and pagination parameters. Any
+/// parameter outside the documented set (`prefix`, `gte`, `gt`, `lte`,
+/// `lt`, `limit`, `cursor`), duplicates, conflicting bounds, or values
+/// that are not valid for their parameter are rejected: filter and cursor
+/// values must be valid key fragments (non-empty, `[A-Za-z0-9_-]`), and
+/// `limit` must be a decimal integer in 1..=1000.
+fn parse_list_query(query: &str) -> Result<ListQuery, ()> {
+    let mut parsed = ListQuery::default();
+    if query.is_empty() {
+        return Ok(parsed);
+    }
+    let filter = &mut parsed.filter;
     let mut gte: Option<String> = None;
     let mut gt: Option<String> = None;
     let mut lte: Option<String> = None;
@@ -329,17 +357,25 @@ fn parse_key_filter(query: &str) -> Result<KeyFilter, ()> {
         let (raw_name, raw_value) = pair.split_once('=').ok_or(())?;
         let name = percent_decode(raw_name)?;
         let value = percent_decode(raw_value)?;
-        if !valid_identifier(&value) {
-            return Err(());
-        }
         let slot = match name.as_str() {
             "prefix" => &mut filter.prefix,
             "gte" => &mut gte,
             "gt" => &mut gt,
             "lte" => &mut lte,
             "lt" => &mut lt,
+            "limit" => {
+                if parsed.limit.is_some() {
+                    return Err(());
+                }
+                parsed.limit = Some(parse_limit(&value)?);
+                continue;
+            }
+            "cursor" => &mut parsed.cursor,
             _ => return Err(()),
         };
+        if !valid_identifier(&value) {
+            return Err(());
+        }
         if slot.is_some() {
             return Err(());
         }
@@ -357,7 +393,7 @@ fn parse_key_filter(query: &str) -> Result<KeyFilter, ()> {
     }
     filter.lower = gte.map(|b| (b, true)).or_else(|| gt.map(|b| (b, false)));
     filter.upper = lte.map(|b| (b, true)).or_else(|| lt.map(|b| (b, false)));
-    Ok(filter)
+    Ok(parsed)
 }
 
 async fn list_records(
@@ -368,10 +404,11 @@ async fn list_records(
     if !valid_identifier(&name) {
         return error_response(StatusCode::BAD_REQUEST, "invalid_identifier");
     }
-    let filter = match parse_key_filter(uri.query().unwrap_or("")) {
-        Ok(filter) => filter,
+    let query = match parse_list_query(uri.query().unwrap_or("")) {
+        Ok(query) => query,
         Err(()) => return error_response(StatusCode::BAD_REQUEST, "invalid_query"),
     };
+    let filter = &query.filter;
 
     // Shared guard across the whole scan: commits rename files one by one,
     // so without this a list could interleave a batch in progress.
@@ -437,7 +474,38 @@ async fn list_records(
 
     // Byte-wise order on UTF-8 is Unicode code-point order.
     records.sort_by(|a, b| a.0.cmp(&b.0));
-    let records: Vec<Value> = records
+
+    // Cursor resume point: the first hit strictly after the token key. The
+    // token must be consistent with this request's filter and must not
+    // point at or past the end of the hit set (a well-formed final page
+    // carries no nextCursor, so such a token could never have been issued
+    // for it). Key-based positioning keeps a page sequence stable under
+    // concurrent writes: inserts/deletes before the token cannot shift it.
+    let start = match &query.cursor {
+        Some(cursor) => {
+            if !filter.matches(cursor) {
+                return error_response(StatusCode::BAD_REQUEST, "invalid_query");
+            }
+            let pos = records.partition_point(|(key, _, _)| key.as_str() <= cursor.as_str());
+            if pos >= records.len() {
+                return error_response(StatusCode::BAD_REQUEST, "invalid_query");
+            }
+            pos
+        }
+        None => 0,
+    };
+    let mut page = records.split_off(start);
+    // Truncate to the page size; a truncated page means more records
+    // remain, so hand back the last returned key as the nextCursor token.
+    let mut next_cursor: Option<String> = None;
+    if let Some(limit) = query.limit
+        && page.len() > limit
+    {
+        page.truncate(limit);
+        next_cursor = page.last().map(|(key, _, _)| key.clone());
+    }
+
+    let records: Vec<Value> = page
         .into_iter()
         .map(|(key, value, modified)| {
             json!({
@@ -447,7 +515,11 @@ async fn list_records(
             })
         })
         .collect();
-    Json(json!({ "name": name, "records": records })).into_response()
+    let mut body = json!({ "name": name, "records": records });
+    if let Some(next_cursor) = next_cursor {
+        body["nextCursor"] = json!(next_cursor);
+    }
+    Json(body).into_response()
 }
 
 // ---------------------------------------------------------------------------

@@ -15,7 +15,7 @@ VDE_BIND=127.0.0.1:8080 cargo run --locked
 | --- | --- |
 | `GET /health` | `{"status":"ok"}` |
 | `GET /version` | `{"name":"versioned-data-engine","version":"0.1.0"}` |
-| `GET /datasets/{name}/records` | 200 `{"name":<数据集名>,"records":[{"key":<key>,"value":<JSON 值>,"updatedAt":<RFC3339 UTC>},...]}`，records 按 key 的 Unicode 码点升序；支持按键前缀或键区间筛选（见下文「记录筛选」）；400 `{"error":"invalid_identifier"}` / `{"error":"invalid_query"}`，404 `{"error":"not_found"}`，500 `{"error":"internal"}` |
+| `GET /datasets/{name}/records` | 200 `{"name":<数据集名>,"records":[{"key":<key>,"value":<JSON 值>,"updatedAt":<RFC3339 UTC>},...]}`，records 按 key 的 Unicode 码点升序；支持按键前缀或键区间筛选（见下文「记录筛选」）与按键排序的分页（见下文「分页」）；400 `{"error":"invalid_identifier"}` / `{"error":"invalid_query"}`，404 `{"error":"not_found"}`，500 `{"error":"internal"}` |
 | `PUT /datasets/{name}/records` | 批量写入记录，见下文「批量写入」；200 `{"name":<数据集名>,"records":[{"key":<key>,"value":<JSON 值>,"updatedAt":<RFC3339 UTC>},...]}`（records 按 key 的 Unicode 码点升序）；400 `{"error":"invalid_identifier"}` / `{"error":"invalid_json"}`，500 `{"error":"internal"}` |
 
 ### 记录筛选
@@ -35,10 +35,30 @@ VDE_BIND=127.0.0.1:8080 cargo run --locked
 - 参数取值必须非空且只含 `[A-Za-z0-9_-]`（与 key 的字符集一致），需按 URL 查询参数规则做百分号编码。
 - `prefix` 与区间参数（`gte`/`gt`/`lte`/`lt`）互斥，不得同时出现。
 - 下界至多一个（`gte` 与 `gt` 二选一），上界至多一个（`lte` 与 `lt` 二选一）；下界与上界可同时使用，构成区间。
-- 除上述参数外的任何查询参数、重复参数、空取值或无法解析的取值，一律返回 400 `{"error":"invalid_query"}`。
+- 除上述筛选参数与下文「分页」的 `limit`、`cursor` 外的任何查询参数、重复参数、空取值或无法解析的取值，一律返回 400 `{"error":"invalid_query"}`。
 - 筛选无命中时返回 200 与空 `records` 数组，不返回 404。
 
 示例：`GET /datasets/ds1/records?prefix=user-0`、`GET /datasets/ds1/records?gte=user-000&lt=user-100`。
+
+### 分页
+
+`GET /datasets/{name}/records` 支持按键排序的稳定分页，分页参数可与上述筛选参数任意组合（筛选的互斥与唯一约束不变）。不带 `limit`、`cursor` 时行为与不分页的列表完全一致。新增参数（均为可选）：
+
+| 参数 | 含义 |
+| --- | --- |
+| `limit=<值>` | 每页条数：十进制正整数，取值 1 到 1000 |
+| `cursor=<值>` | 继续令牌：上一页响应中的 `nextCursor`，原样带回 |
+
+规则：
+
+- 带 `limit` 的请求取筛选命中集，按 key 的 Unicode 码点升序，从起点返回至多 `limit` 条；`limit` 大于或等于命中条数时返回全部命中记录。
+- 本页之后仍有更多记录时，响应增加 `"nextCursor"` 字段，值为不透明令牌（非空，只含 `[A-Za-z0-9_-]`）；调用方将其原样作为下一次请求的 `cursor`，并携带与本次完全相同的筛选条件。最后一页不带 `nextCursor`。
+- 带 `cursor` 的请求从令牌指向位置之后（key 序）开始返回；`cursor` 可单独使用，也可与 `limit` 同用。
+- 翻页在并发写入下稳定：同一翻页序列对原有命中集不跳过、不重复，每条记录至多出现一次，相邻页在 key 序上连续；翻页期间新增、删除的记录不影响已翻过的位置。
+- `limit`、`cursor` 重复出现、取值非法或无法解析（如 `limit` 非十进制正整数或超出 1..=1000、`cursor` 为空或含 `[A-Za-z0-9_-]` 之外的字符）、令牌与本次筛选条件不一致、令牌损坏或越界，以及任何未文档化参数，一律返回 400 `{"error":"invalid_query"}`。
+- 数据集目录不存在仍返回 404 `{"error":"not_found"}`；命中范围内存在损坏或不可读的记录时整个请求返回 500 `{"error":"internal"}`，不输出部分记录。
+
+示例：`GET /datasets/ds1/records?prefix=user-&limit=100` 返回首页后，用 `GET /datasets/ds1/records?prefix=user-&limit=100&cursor=<nextCursor>` 取下一页，直到响应不再含 `nextCursor`。
 
 ### 批量写入
 
