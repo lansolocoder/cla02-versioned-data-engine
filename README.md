@@ -1,6 +1,6 @@
 # Versioned Data Engine
 
-面向团队数据服务的 Rust HTTP/JSON 程序。当前仅提供健康状态和版本信息，尚无数据写入、存储或查询功能。
+面向团队数据服务的 Rust HTTP/JSON 程序。提供健康状态、版本信息，以及按数据集组织的记录单条/批量写入与查询能力。
 
 需要 Rust 1.98.1；工具链由 `rust-toolchain.toml` 固定。
 
@@ -15,7 +15,37 @@ VDE_BIND=127.0.0.1:8080 cargo run --locked
 | --- | --- |
 | `GET /health` | `{"status":"ok"}` |
 | `GET /version` | `{"name":"versioned-data-engine","version":"0.1.0"}` |
+| `PUT /datasets/{name}/records/{key}` | 200 `{"key":<key>,"value":<JSON 值>}`，body 为该记录的任意 JSON 值；key 已存在则覆盖。400 `{"error":"invalid_identifier"}` / `{"error":"invalid_json"}`，500 `{"error":"internal"}` |
+| `GET /datasets/{name}/records/{key}` | 200 `{"key":<key>,"value":<JSON 值>}`；400 `{"error":"invalid_identifier"}`，404 `{"error":"not_found"}`，500 `{"error":"internal"}` |
+| `PUT /datasets/{name}/records` | 批量写入（见下文「批量写入」）：200 `{"name":<数据集名>,"records":[{"key":<key>,"value":<JSON 值>,"updatedAt":<RFC3339 UTC>},...]}`，records 按 key 的 Unicode 码点升序；400 `{"error":"invalid_identifier"}` / `{"error":"invalid_json"}`，500 `{"error":"internal"}` |
 | `GET /datasets/{name}/records` | 200 `{"name":<数据集名>,"records":[{"key":<key>,"value":<JSON 值>,"updatedAt":<RFC3339 UTC>},...]}`，records 按 key 的 Unicode 码点升序；支持按键前缀或键区间筛选（见下文「记录筛选」）；400 `{"error":"invalid_identifier"}` / `{"error":"invalid_query"}`，404 `{"error":"not_found"}`，500 `{"error":"internal"}` |
+
+### 批量写入
+
+`PUT /datasets/{name}/records` 在一个事务里写入整批记录，整批要么全部生效，要么一条都不写。请求体为：
+
+```json
+{"records":[{"key":<key>,"value":<JSON 值>},...]}
+```
+
+规则：
+
+- 数据集名与每个 key 沿用既有标识符规则（非空，仅含 `[A-Za-z0-9_-]`）；任一不合法返回 400 `{"error":"invalid_identifier"}`。
+- body 为空、不是合法 JSON、`records` 缺失或不是数组、条目缺 `key`/`value`、同一批次出现重复 key，一律返回 400 `{"error":"invalid_json"}`，数据集保持原样。
+- key 已存在则覆盖旧值并更新 `updatedAt`，不存在则新增。
+- 空 `records` 数组是合法批次：返回 200 与空 `records` 数组，不改动数据集。
+- 写入过程中任一步骤失败时回滚本次已改动记录到请求前的值与 `updatedAt`，返回 500 `{"error":"internal"}`；失败后读到的数据集与请求前完全一致。
+- 成功返回 200，响应体中的 `updatedAt` 为该条写入完成时刻（RFC3339 UTC，格式与记录列表一致），records 按 key 的 Unicode 码点升序。
+- 写入对并发请求是原子可见的：其他请求只能看到写入前或写入后的完整数据集，不会看到写到一半的批次；进程崩溃或被杀后重启，数据集恢复为整个批次生效或完全未生效的某个完整状态。
+- 写入成功后，单条 GET 与记录列表（含前缀与区间筛选）立即反映新值，排序与 `updatedAt` 语义不变。
+
+示例：
+
+```sh
+curl -X PUT http://127.0.0.1:8080/datasets/ds1/records \
+  -H 'Content-Type: application/json' \
+  -d '{"records":[{"key":"user-1","value":{"name":"ada"}},{"key":"user-2","value":42}]}'
+```
 
 ### 记录筛选
 
