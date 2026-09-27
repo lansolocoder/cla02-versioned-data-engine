@@ -185,6 +185,84 @@ fn format_rfc3339_utc(t: SystemTime) -> String {
     format!("{year:04}-{month:02}-{day:02}T{hour:02}:{min:02}:{sec:02}Z")
 }
 
+/// Key filter parsed from the list-records query string. All present
+/// conditions must hold for a key to match (logical AND).
+#[derive(Default)]
+struct KeyFilter {
+    prefix: Option<String>,
+    /// (bound, inclusive)
+    lower: Option<(String, bool)>,
+    /// (bound, inclusive)
+    upper: Option<(String, bool)>,
+}
+
+impl KeyFilter {
+    fn matches(&self, key: &str) -> bool {
+        if let Some(prefix) = &self.prefix {
+            if !key.starts_with(prefix.as_str()) {
+                return false;
+            }
+        }
+        if let Some((bound, inclusive)) = &self.lower {
+            let ord = key.cmp(bound);
+            if ord == std::cmp::Ordering::Less || (!inclusive && ord == std::cmp::Ordering::Equal) {
+                return false;
+            }
+        }
+        if let Some((bound, inclusive)) = &self.upper {
+            let ord = key.cmp(bound);
+            if ord == std::cmp::Ordering::Greater || (!inclusive && ord == std::cmp::Ordering::Equal)
+            {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+/// Parse the query string of `GET /datasets/{name}/records`. Only the
+/// documented filter parameters are allowed; anything else, duplicates,
+/// conflicting bounds, or malformed values yield 400 `invalid_query`.
+fn parse_key_filter(query: Option<&str>) -> Result<KeyFilter, Response> {
+    let invalid = || error_response(StatusCode::BAD_REQUEST, "invalid_query");
+    let mut filter = KeyFilter::default();
+    let query = match query {
+        None => return Ok(filter),
+        Some(q) if q.is_empty() => return Ok(filter),
+        Some(q) => q,
+    };
+    for pair in query.split('&') {
+        let (param, value) = pair.split_once('=').ok_or_else(invalid)?;
+        // Filter values use the same charset as keys; anything else
+        // (including empty values) cannot be parsed into a key bound.
+        if !valid_identifier(value) {
+            return Err(invalid());
+        }
+        let value = value.to_owned();
+        match param {
+            "prefix" => {
+                if filter.prefix.replace(value).is_some() {
+                    return Err(invalid());
+                }
+            }
+            "gte" | "gt" => {
+                if filter.lower.is_some() {
+                    return Err(invalid());
+                }
+                filter.lower = Some((value, param == "gte"));
+            }
+            "lte" | "le" => {
+                if filter.upper.is_some() {
+                    return Err(invalid());
+                }
+                filter.upper = Some((value, param == "lte"));
+            }
+            _ => return Err(invalid()),
+        }
+    }
+    Ok(filter)
+}
+
 async fn list_records(
     State(state): State<AppState>,
     Path(name): Path<String>,
@@ -193,9 +271,10 @@ async fn list_records(
     if !valid_identifier(&name) {
         return error_response(StatusCode::BAD_REQUEST, "invalid_identifier");
     }
-    if uri.query().is_some_and(|q| !q.is_empty()) {
-        return error_response(StatusCode::BAD_REQUEST, "invalid_query");
-    }
+    let filter = match parse_key_filter(uri.query()) {
+        Ok(filter) => filter,
+        Err(resp) => return resp,
+    };
 
     let dir = state.data_dir.join(&name);
     let mut entries = match tokio::fs::read_dir(&dir).await {
@@ -226,6 +305,12 @@ async fn list_records(
         let Some(key) = file_name.strip_suffix(".json") else {
             continue;
         };
+        // Filter on the key alone, before reading: records outside the
+        // matching set are never touched, so a corrupt file out of range
+        // cannot fail this request.
+        if !filter.matches(key) {
+            continue;
+        }
 
         let result = async {
             let bytes = tokio::fs::read(entry.path()).await?;
