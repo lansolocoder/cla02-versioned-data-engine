@@ -185,6 +185,135 @@ fn format_rfc3339_utc(t: SystemTime) -> String {
     format!("{year:04}-{month:02}-{day:02}T{hour:02}:{min:02}:{sec:02}Z")
 }
 
+/// Key-only filter for record listing, parsed from the query string.
+/// Either a prefix match, or a lower/upper bound range (each bound
+/// inclusive or exclusive), but never both.
+#[derive(Default)]
+struct KeyFilter {
+    prefix: Option<String>,
+    /// (bound, inclusive)
+    lower: Option<(String, bool)>,
+    /// (bound, inclusive)
+    upper: Option<(String, bool)>,
+}
+
+impl KeyFilter {
+    fn matches(&self, key: &str) -> bool {
+        if let Some(prefix) = &self.prefix {
+            return key.starts_with(prefix.as_str());
+        }
+        if let Some((bound, inclusive)) = &self.lower {
+            let ok = if *inclusive {
+                key >= bound.as_str()
+            } else {
+                key > bound.as_str()
+            };
+            if !ok {
+                return false;
+            }
+        }
+        if let Some((bound, inclusive)) = &self.upper {
+            let ok = if *inclusive {
+                key <= bound.as_str()
+            } else {
+                key < bound.as_str()
+            };
+            if !ok {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Decode one query-string component: `%XX` escapes and `+` as space.
+fn percent_decode(s: &str) -> Result<String, ()> {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' => {
+                if i + 2 >= bytes.len() {
+                    return Err(());
+                }
+                let hi = hex_val(bytes[i + 1]).ok_or(())?;
+                let lo = hex_val(bytes[i + 2]).ok_or(())?;
+                out.push(hi << 4 | lo);
+                i += 3;
+            }
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8(out).map_err(|_| ())
+}
+
+/// Parse the query string into a key filter. Any parameter outside the
+/// documented set (`prefix`, `gte`, `gt`, `lte`, `lt`), duplicates,
+/// conflicting bounds, or values that are not valid key fragments
+/// (non-empty, `[A-Za-z0-9_-]`) are rejected.
+fn parse_key_filter(query: &str) -> Result<KeyFilter, ()> {
+    let mut filter = KeyFilter::default();
+    if query.is_empty() {
+        return Ok(filter);
+    }
+    let mut gte: Option<String> = None;
+    let mut gt: Option<String> = None;
+    let mut lte: Option<String> = None;
+    let mut lt: Option<String> = None;
+
+    for pair in query.split('&') {
+        let (raw_name, raw_value) = pair.split_once('=').ok_or(())?;
+        let name = percent_decode(raw_name)?;
+        let value = percent_decode(raw_value)?;
+        if !valid_identifier(&value) {
+            return Err(());
+        }
+        let slot = match name.as_str() {
+            "prefix" => &mut filter.prefix,
+            "gte" => &mut gte,
+            "gt" => &mut gt,
+            "lte" => &mut lte,
+            "lt" => &mut lt,
+            _ => return Err(()),
+        };
+        if slot.is_some() {
+            return Err(());
+        }
+        *slot = Some(value);
+    }
+
+    if filter.prefix.is_some() && (gte.is_some() || gt.is_some() || lte.is_some() || lt.is_some())
+    {
+        return Err(());
+    }
+    if gte.is_some() && gt.is_some() {
+        return Err(());
+    }
+    if lte.is_some() && lt.is_some() {
+        return Err(());
+    }
+    filter.lower = gte.map(|b| (b, true)).or_else(|| gt.map(|b| (b, false)));
+    filter.upper = lte.map(|b| (b, true)).or_else(|| lt.map(|b| (b, false)));
+    Ok(filter)
+}
+
 async fn list_records(
     State(state): State<AppState>,
     Path(name): Path<String>,
@@ -193,9 +322,10 @@ async fn list_records(
     if !valid_identifier(&name) {
         return error_response(StatusCode::BAD_REQUEST, "invalid_identifier");
     }
-    if uri.query().is_some_and(|q| !q.is_empty()) {
-        return error_response(StatusCode::BAD_REQUEST, "invalid_query");
-    }
+    let filter = match parse_key_filter(uri.query().unwrap_or("")) {
+        Ok(filter) => filter,
+        Err(()) => return error_response(StatusCode::BAD_REQUEST, "invalid_query"),
+    };
 
     let dir = state.data_dir.join(&name);
     let mut entries = match tokio::fs::read_dir(&dir).await {
@@ -226,6 +356,11 @@ async fn list_records(
         let Some(key) = file_name.strip_suffix(".json") else {
             continue;
         };
+        // Filter on the key alone, before reading: records outside the hit
+        // set are excluded even if their file is corrupt or unreadable.
+        if !filter.matches(key) {
+            continue;
+        }
 
         let result = async {
             let bytes = tokio::fs::read(entry.path()).await?;
