@@ -16,6 +16,7 @@ VDE_BIND=127.0.0.1:8080 cargo run --locked
 | `GET /health` | `{"status":"ok"}` |
 | `GET /version` | `{"name":"versioned-data-engine","version":"0.1.0"}` |
 | `GET /datasets/{name}/records` | 200 `{"name":<数据集名>,"records":[{"key":<key>,"value":<JSON 值>,"updatedAt":<RFC3339 UTC>},...]}`，records 按 key 的 Unicode 码点升序；支持按键前缀或键区间筛选（见下文「记录筛选」）；400 `{"error":"invalid_identifier"}` / `{"error":"invalid_query"}`，404 `{"error":"not_found"}`，500 `{"error":"internal"}` |
+| `PUT /datasets/{name}/records` | 批量写入记录，见下文「批量写入」；200 `{"name":<数据集名>,"records":[{"key":<key>,"value":<JSON 值>,"updatedAt":<RFC3339 UTC>},...]}`（records 按 key 的 Unicode 码点升序）；400 `{"error":"invalid_identifier"}` / `{"error":"invalid_json"}`，500 `{"error":"internal"}` |
 
 ### 记录筛选
 
@@ -38,6 +39,28 @@ VDE_BIND=127.0.0.1:8080 cargo run --locked
 - 筛选无命中时返回 200 与空 `records` 数组，不返回 404。
 
 示例：`GET /datasets/ds1/records?prefix=user-0`、`GET /datasets/ds1/records?gte=user-000&lt=user-100`。
+
+### 批量写入
+
+`PUT /datasets/{name}/records` 在一次请求中写入多条记录，请求体为 JSON 对象：
+
+```json
+{"records":[{"key":"user-1","value":{"name":"Ada"}},{"key":"user-2","value":42}]}
+```
+
+- `name` 与每个 `key` 沿用既有标识符规则：非空且只含 `[A-Za-z0-9_-]`；不合法返回 400 `{"error":"invalid_identifier"}`。
+- 请求体非合法 JSON、为空、缺少 `records` 或其不是数组、条目缺少 `key`/`value`、同一批次出现重复 key，一律返回 400 `{"error":"invalid_json"}`，数据集保持原样。
+- 批次为原子操作：要么全部写入成功，要么一条都不写。任一写入步骤失败时回滚本次改动到请求前的值与 updatedAt，返回 500 `{"error":"internal"}`，失败后数据集与请求前完全一致。
+- 成功返回 200：`{"name":<数据集名>,"records":[{"key":<key>,"value":<JSON 值>,"updatedAt":<RFC3339 UTC>},...]}`，records 按 key 的 Unicode 码点升序，updatedAt 为该条写入完成时刻，格式与记录列表一致。
+- key 已存在则覆盖旧值并更新 updatedAt，不存在则新增；写入成功后单条 GET 与记录列表（含前缀与区间筛选）立即反映新值。
+- 空 `records` 数组（`{"records":[]}`）为合法批次，返回 200 与空 `records` 数组，不改动数据集。
+- 并发请求只能看到写入前或写入后的完整数据集；进程崩溃或被杀后重启，数据集恢复为某个完整状态（整个批次生效或完全未生效）。
+
+```sh
+curl -X PUT http://127.0.0.1:8080/datasets/ds1/records \
+  -H 'Content-Type: application/json' \
+  -d '{"records":[{"key":"user-1","value":{"name":"Ada"}},{"key":"user-2","value":42}]}'
+```
 
 ```sh
 curl http://127.0.0.1:8080/health
