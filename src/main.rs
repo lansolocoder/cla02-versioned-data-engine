@@ -541,6 +541,72 @@ fn parse_list_query(query: &str) -> Result<ListQuery, ()> {
     })
 }
 
+/// Parse the stats query string into a key filter, with exactly the same
+/// grammar as the list endpoint's filter parameters. Pagination and any
+/// other parameter are undocumented here and therefore rejected. Duplicates,
+/// `prefix`/range conflicts, two lower or two upper bounds, empty values,
+/// and values outside `[A-Za-z0-9_-]` are all errors.
+fn parse_stats_query(query: &str) -> Result<KeyFilter, ()> {
+    let mut prefix: Option<String> = None;
+    let mut gte: Option<String> = None;
+    let mut gt: Option<String> = None;
+    let mut lte: Option<String> = None;
+    let mut lt: Option<String> = None;
+
+    if !query.is_empty() {
+        for pair in query.split('&') {
+            let (raw_name, raw_value) = pair.split_once('=').ok_or(())?;
+            let name = percent_decode(raw_name)?;
+            let value = percent_decode(raw_value)?;
+            let slot = match name.as_str() {
+                "prefix" => &mut prefix,
+                "gte" => &mut gte,
+                "gt" => &mut gt,
+                "lte" => &mut lte,
+                "lt" => &mut lt,
+                _ => return Err(()),
+            };
+            if !valid_identifier(&value) || slot.is_some() {
+                return Err(());
+            }
+            *slot = Some(value);
+        }
+    }
+
+    if prefix.is_some() && (gte.is_some() || gt.is_some() || lte.is_some() || lt.is_some()) {
+        return Err(());
+    }
+    if gte.is_some() && gt.is_some() {
+        return Err(());
+    }
+    if lte.is_some() && lt.is_some() {
+        return Err(());
+    }
+    Ok(KeyFilter {
+        prefix,
+        lower: gte.map(|b| (b, true)).or_else(|| gt.map(|b| (b, false))),
+        upper: lte.map(|b| (b, true)).or_else(|| lt.map(|b| (b, false))),
+    })
+}
+
+/// Validate that one record file contains exactly one complete JSON
+/// document — the same acceptance rule `serde_json` applies when the list
+/// endpoint parses a record (empty files, truncation, garbage, and trailing
+/// bytes are all rejected). The value itself is discarded: parsing streams
+/// through a fixed-size buffer and `IgnoredAny` walks the structure without
+/// ever building a JSON value, so stats never hold record value bytes.
+fn validate_record_file(path: &Path) -> Result<(), ()> {
+    let file = std::fs::File::open(path).map_err(|_| ())?;
+    let reader = std::io::BufReader::with_capacity(8 * 1024, file);
+    let mut de = serde_json::Deserializer::from_reader(reader);
+    // `IgnoredAny` is the visitor that walks and discards every token: the
+    // value is never materialized, no matter how large it is.
+    serde::Deserializer::deserialize_ignored_any(&mut de, serde::de::IgnoredAny).map_err(|_| ())?;
+    // Reject trailing bytes after the single JSON value, as from_slice would.
+    de.end().map_err(|_| ())?;
+    Ok(())
+}
+
 async fn list_records(
     State(state): State<AppState>,
     PathParam(name): PathParam<String>,
@@ -697,6 +763,105 @@ async fn list_records(
         body["nextCursor"] = Value::String(token);
     }
     Json(body).into_response()
+}
+
+// ---------------------------------------------------------------------------
+// Key-range statistics
+// ---------------------------------------------------------------------------
+
+/// Aggregate stats over a dataset (or one key filter): the hit count and the
+/// smallest/largest hit key. Only directory entries are enumerated; record
+/// files are streamed through the JSON parser solely to surface corruption
+/// in the hit range as a 500 — values are never read into memory, so the
+/// request does not scale with total record-value size.
+async fn dataset_stats(
+    State(state): State<AppState>,
+    PathParam(name): PathParam<String>,
+    uri: Uri,
+) -> Response {
+    if !valid_identifier(&name) {
+        return error_response(StatusCode::BAD_REQUEST, "invalid_identifier");
+    }
+    let filter = match parse_stats_query(uri.query().unwrap_or("")) {
+        Ok(filter) => filter,
+        Err(()) => return error_response(StatusCode::BAD_REQUEST, "invalid_query"),
+    };
+
+    // Same shared guard as list: a stats request can only ever observe the
+    // dataset before or after a complete write, never a batch in progress.
+    let lock = dataset_lock(&name).await;
+    let _guard = lock.read().await;
+    let dir = state.data_dir.join(&name);
+    let mut entries = match tokio::fs::read_dir(&dir).await {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return error_response(StatusCode::NOT_FOUND, "not_found");
+        }
+        Err(e) => {
+            tracing_error(&e);
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal");
+        }
+    };
+
+    // Min/max are folded while enumerating; no sort and no collected key
+    // list are needed.
+    let mut count: u64 = 0;
+    let mut first_key: Option<String> = None;
+    let mut last_key: Option<String> = None;
+    loop {
+        let entry = match entries.next_entry().await {
+            Ok(Some(entry)) => entry,
+            Ok(None) => break,
+            Err(e) => {
+                tracing_error(&e);
+                return error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal");
+            }
+        };
+        // Mirror the list endpoint: ignore non-UTF-8 names and anything that
+        // is not a `*.json` record file.
+        let file_name = entry.file_name();
+        let Some(file_name) = file_name.to_str() else {
+            continue;
+        };
+        let Some(key) = file_name.strip_suffix(".json") else {
+            continue;
+        };
+        // Keys outside the filter are excluded first; corrupt files outside
+        // the hit range must not affect the result.
+        if !filter.matches(key) {
+            continue;
+        }
+
+        // A corrupt or unreadable record inside the hit range fails the
+        // whole request — stats must describe exactly the list's hit set,
+        // which would 500 on the same file. The value stays on disk: only
+        // JSON syntax is streamed through.
+        let path = entry.path();
+        let check = tokio::task::spawn_blocking(move || validate_record_file(&path)).await;
+        if !matches!(check, Ok(Ok(()))) {
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal");
+        }
+
+        count += 1;
+        if first_key.as_deref().is_none_or(|first| key < first) {
+            first_key = Some(key.to_owned());
+        }
+        if last_key.as_deref().is_none_or(|last| key > last) {
+            last_key = Some(key.to_owned());
+        }
+    }
+
+    // No hits: the boundary fields are omitted entirely.
+    match (first_key, last_key) {
+        (Some(first), Some(last)) => Json(json!({
+            "name": name,
+            "count": count,
+            "firstKey": first,
+            "lastKey": last,
+        }))
+        .into_response(),
+        _ => Json(json!({ "name": name, "count": 0 })).into_response(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1271,6 +1436,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             "/datasets/{name}/records",
             get(list_records).put(put_records),
         )
+        .route("/datasets/{name}/stats", get(dataset_stats))
         .with_state(state);
 
     println!("Listening on http://{}", listener.local_addr()?);
@@ -1344,6 +1510,55 @@ mod tests {
         })
         .unwrap();
         assert!(decode_cursor(&empty_after).is_err());
+    }
+
+    #[test]
+    fn stats_query_accepts() {
+        // No filter: whole dataset.
+        assert_eq!(parse_stats_query("").unwrap(), KeyFilter::default());
+
+        let q = parse_stats_query("prefix=user-").unwrap();
+        assert_eq!(q.prefix.as_deref(), Some("user-"));
+        assert!(q.lower.is_none() && q.upper.is_none());
+
+        let q = parse_stats_query("gte=a&lt=z").unwrap();
+        assert_eq!(q.lower, Some(("a".to_owned(), true)));
+        assert_eq!(q.upper, Some(("z".to_owned(), false)));
+
+        // Only one bound on a side is legal.
+        let q = parse_stats_query("gt=lo&lte=hi").unwrap();
+        assert_eq!(q.lower, Some(("lo".to_owned(), false)));
+        assert_eq!(q.upper, Some(("hi".to_owned(), true)));
+    }
+
+    #[test]
+    fn stats_query_rejects() {
+        let bad = [
+            // Undocumented parameters, including the list endpoint's
+            // pagination params.
+            "limit=10",
+            "cursor=Abc",
+            "unknown=1",
+            // Empty or malformed pairs.
+            "prefix=",
+            "=x",
+            "prefix",
+            // Illegal value charset.
+            "prefix=a.b",
+            "gte=ä",
+            // Duplicated parameters.
+            "prefix=a&prefix=b",
+            "gte=a&gt=b",
+            // prefix vs range.
+            "prefix=p&gte=a",
+            "prefix=p&lt=z",
+            // Two bounds on one side.
+            "gte=a&gt=b",
+            "lte=a&lt=b",
+        ];
+        for case in bad {
+            assert!(parse_stats_query(case).is_err(), "should reject {case:?}");
+        }
     }
 
     #[test]
