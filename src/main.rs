@@ -32,6 +32,19 @@ struct Version {
     version: &'static str,
 }
 
+/// Successful body of `GET /datasets/{name}/stats`. The key fields are
+/// omitted entirely for an empty hit set, so an empty result serializes as
+/// just `{"name":...,"count":0}`.
+#[derive(Serialize)]
+struct StatsResponse {
+    name: String,
+    count: u64,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "firstKey")]
+    first_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "lastKey")]
+    last_key: Option<String>,
+}
+
 async fn health() -> Json<Health> {
     Json(Health { status: "ok" })
 }
@@ -446,99 +459,155 @@ struct ListQuery {
     cursor: Option<String>,
 }
 
+/// Feed every decoded `(name, value)` pair of a query string to `on_pair`.
+/// A missing `=`, a `%XX` escape that cannot be decoded, or a value that is
+/// not valid UTF-8 is rejected, matching the list endpoint's parsing. An
+/// empty query string yields no pairs.
+fn for_each_query_pair(
+    query: &str,
+    mut on_pair: impl FnMut(&str, String) -> Result<(), ()>,
+) -> Result<(), ()> {
+    if query.is_empty() {
+        return Ok(());
+    }
+    for pair in query.split('&') {
+        let (raw_name, raw_value) = pair.split_once('=').ok_or(())?;
+        let name = percent_decode(raw_name)?;
+        let value = percent_decode(raw_value)?;
+        on_pair(&name, value)?;
+    }
+    Ok(())
+}
+
+/// Accumulator for the five key-filter parameters (`prefix`, `gte`, `gt`,
+/// `lte`, `lt`) while scanning a query string, shared by the list and stats
+/// parsers so both accept exactly the same filter dialect.
+#[derive(Default)]
+struct FilterSlots {
+    prefix: Option<String>,
+    gte: Option<String>,
+    gt: Option<String>,
+    lte: Option<String>,
+    lt: Option<String>,
+}
+
+impl FilterSlots {
+    /// Store one filter parameter, rejecting empty/illegal values and any
+    /// repeated parameter.
+    fn take(&mut self, name: &str, value: String) -> Result<(), ()> {
+        if !valid_identifier(&value) {
+            return Err(());
+        }
+        let slot = match name {
+            "prefix" => &mut self.prefix,
+            "gte" => &mut self.gte,
+            "gt" => &mut self.gt,
+            "lte" => &mut self.lte,
+            "lt" => &mut self.lt,
+            _ => return Err(()),
+        };
+        if slot.is_some() {
+            return Err(());
+        }
+        *slot = Some(value);
+        Ok(())
+    }
+
+    /// Validate the mutual-exclusion rules and assemble the filter:
+    /// `prefix` excludes any bound, at most one lower and one upper bound.
+    fn build(self) -> Result<KeyFilter, ()> {
+        if self.prefix.is_some()
+            && (self.gte.is_some() || self.gt.is_some() || self.lte.is_some() || self.lt.is_some())
+        {
+            return Err(());
+        }
+        if self.gte.is_some() && self.gt.is_some() {
+            return Err(());
+        }
+        if self.lte.is_some() && self.lt.is_some() {
+            return Err(());
+        }
+        Ok(KeyFilter {
+            prefix: self.prefix,
+            lower: self
+                .gte
+                .map(|b| (b, true))
+                .or_else(|| self.gt.map(|b| (b, false))),
+            upper: self
+                .lte
+                .map(|b| (b, true))
+                .or_else(|| self.lt.map(|b| (b, false))),
+        })
+    }
+}
+
 /// Parse the query string into a key filter and pagination parameters. Any
 /// parameter outside the documented set (`prefix`, `gte`, `gt`, `lte`,
 /// `lt`, `limit`, `cursor`), duplicates, conflicting bounds, values that are
 /// not valid key fragments (non-empty, `[A-Za-z0-9_-]`), a `limit` outside
 /// 1..=1000, or an empty/illegal `cursor` are rejected.
 fn parse_list_query(query: &str) -> Result<ListQuery, ()> {
-    let mut filter = KeyFilter::default();
-    if query.is_empty() {
-        return Ok(ListQuery {
-            filter,
-            limit: None,
-            cursor: None,
-        });
-    }
-    let mut gte: Option<String> = None;
-    let mut gt: Option<String> = None;
-    let mut lte: Option<String> = None;
-    let mut lt: Option<String> = None;
+    let mut slots = FilterSlots::default();
     let mut limit: Option<usize> = None;
     let mut cursor: Option<String> = None;
 
-    for pair in query.split('&') {
-        let (raw_name, raw_value) = pair.split_once('=').ok_or(())?;
-        let name = percent_decode(raw_name)?;
-        let value = percent_decode(raw_value)?;
-        match name.as_str() {
-            "limit" => {
-                // Strict decimal integer: digits only, no sign or other
-                // characters; range-checked to 1..=1000 below.
-                if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
-                    return Err(());
-                }
-                let parsed: usize = value.parse().map_err(|_| ())?;
-                if !(1..=MAX_LIMIT).contains(&parsed) {
-                    return Err(());
-                }
-                if limit.is_some() {
-                    return Err(());
-                }
-                limit = Some(parsed);
+    for_each_query_pair(query, |name, value| match name {
+        "limit" => {
+            // Strict decimal integer: digits only, no sign or other
+            // characters; range-checked to 1..=1000 below.
+            if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(());
             }
-            "cursor" => {
-                // Non-empty, opaque, charset-restricted. Full structural
-                // validation happens once the current filter is known.
-                if value.is_empty()
-                    || !value
-                        .bytes()
-                        .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
-                {
-                    return Err(());
-                }
-                if cursor.is_some() {
-                    return Err(());
-                }
-                cursor = Some(value);
+            let parsed: usize = value.parse().map_err(|_| ())?;
+            if !(1..=MAX_LIMIT).contains(&parsed) {
+                return Err(());
             }
-            "prefix" | "gte" | "gt" | "lte" | "lt" => {
-                if !valid_identifier(&value) {
-                    return Err(());
-                }
-                let slot = match name.as_str() {
-                    "prefix" => &mut filter.prefix,
-                    "gte" => &mut gte,
-                    "gt" => &mut gt,
-                    "lte" => &mut lte,
-                    "lt" => &mut lt,
-                    _ => unreachable!(),
-                };
-                if slot.is_some() {
-                    return Err(());
-                }
-                *slot = Some(value);
+            if limit.is_some() {
+                return Err(());
             }
-            _ => return Err(()),
+            limit = Some(parsed);
+            Ok(())
         }
-    }
+        "cursor" => {
+            // Non-empty, opaque, charset-restricted. Full structural
+            // validation happens once the current filter is known.
+            if value.is_empty()
+                || !value
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+            {
+                return Err(());
+            }
+            if cursor.is_some() {
+                return Err(());
+            }
+            cursor = Some(value);
+            Ok(())
+        }
+        "prefix" | "gte" | "gt" | "lte" | "lt" => slots.take(name, value),
+        _ => Err(()),
+    })?;
 
-    if filter.prefix.is_some() && (gte.is_some() || gt.is_some() || lte.is_some() || lt.is_some()) {
-        return Err(());
-    }
-    if gte.is_some() && gt.is_some() {
-        return Err(());
-    }
-    if lte.is_some() && lt.is_some() {
-        return Err(());
-    }
-    filter.lower = gte.map(|b| (b, true)).or_else(|| gt.map(|b| (b, false)));
-    filter.upper = lte.map(|b| (b, true)).or_else(|| lt.map(|b| (b, false)));
+    let filter = slots.build()?;
     Ok(ListQuery {
         filter,
         limit,
         cursor,
     })
+}
+
+/// Parse the stats query into a key filter. Only the five key-filter
+/// parameters are documented here: pagination parameters and anything else
+/// are unknown, and (like duplicates, empty values, conflicting bounds, or
+/// values outside the key charset) rejected. No parameters means the whole
+/// dataset is aggregated.
+fn parse_stats_query(query: &str) -> Result<KeyFilter, ()> {
+    let mut slots = FilterSlots::default();
+    for_each_query_pair(query, |name, value| match name {
+        "prefix" | "gte" | "gt" | "lte" | "lt" => slots.take(name, value),
+        _ => Err(()),
+    })?;
+    slots.build()
 }
 
 async fn list_records(
@@ -697,6 +766,122 @@ async fn list_records(
         body["nextCursor"] = Value::String(token);
     }
     Json(body).into_response()
+}
+
+/// Aggregate key-range statistics for a dataset: how many records the filter
+/// hits and the minimum/maximum key among them.
+///
+/// The hit set is exactly the record list's under the same filter (each key
+/// derived from its `<key>.json` file name, compared in Unicode code-point
+/// order), and the same liveness rules apply: a missing dataset directory is
+/// 404, while a corrupt or unreadable record *inside the hit range* fails the
+/// whole request with 500 — no partial statistics. Records outside the range
+/// are never touched, so their state cannot affect the answer.
+///
+/// Only directory metadata is read: record value bytes are never read, so the
+/// cost of a request does not scale with the total size of the values in the
+/// hit range. A stat plus a read-open probe is what makes a damaged or
+/// unreadable in-range record fail the request (mirroring the list endpoint's
+/// read) without pulling its payload.
+async fn dataset_stats(
+    State(state): State<AppState>,
+    PathParam(name): PathParam<String>,
+    uri: Uri,
+) -> Response {
+    if !valid_identifier(&name) {
+        return error_response(StatusCode::BAD_REQUEST, "invalid_identifier");
+    }
+    let filter = match parse_stats_query(uri.query().unwrap_or("")) {
+        Ok(filter) => filter,
+        Err(()) => return error_response(StatusCode::BAD_REQUEST, "invalid_query"),
+    };
+
+    // Same shared guard the list takes: a concurrent (batch) write can only
+    // ever be observed wholly before or wholly after this aggregation.
+    let lock = dataset_lock(&name).await;
+    let _guard = lock.read().await;
+    let dir = state.data_dir.join(&name);
+    let mut entries = match tokio::fs::read_dir(&dir).await {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return error_response(StatusCode::NOT_FOUND, "not_found");
+        }
+        Err(e) => {
+            tracing_error(&e);
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal");
+        }
+    };
+
+    let mut count: u64 = 0;
+    let mut first_key: Option<String> = None;
+    let mut last_key: Option<String> = None;
+    loop {
+        let entry = match entries.next_entry().await {
+            Ok(Some(entry)) => entry,
+            Ok(None) => break,
+            Err(e) => {
+                tracing_error(&e);
+                return error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal");
+            }
+        };
+        let file_name = entry.file_name();
+        let Some(file_name) = file_name.to_str() else {
+            continue;
+        };
+        let Some(key) = file_name.strip_suffix(".json") else {
+            continue;
+        };
+        // Filter on the key alone, exactly like the list path: records
+        // outside the hit set are excluded even if their file is corrupt or
+        // unreadable.
+        if !filter.matches(key) {
+            continue;
+        }
+
+        // Confirm the in-range record is a readable regular file without
+        // reading its value. This follows symlinks (unlike
+        // `DirEntry::metadata`), matching the list endpoint's `read`; the
+        // storage only ever creates regular files, so a non-regular entry is
+        // a damaged record. Statting first also keeps a FIFO from blocking
+        // the subsequent open.
+        let path = entry.path();
+        match tokio::fs::metadata(&path).await {
+            Ok(meta) if meta.is_file() => {}
+            Ok(_) => {
+                eprintln!("corrupt record {name}/{key}: not a regular file");
+                return error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal");
+            }
+            Err(e) => {
+                tracing_error(&e);
+                return error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal");
+            }
+        }
+        // A read-open surfaces permission/I/O failures (e.g. an unreadable
+        // regular file such as mode 000) that stat alone would miss; the
+        // payload is never read.
+        if let Err(e) = tokio::fs::OpenOptions::new().read(true).open(&path).await {
+            tracing_error(&e);
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal");
+        }
+
+        count += 1;
+        // Byte-wise comparison on UTF-8 is Unicode code-point order.
+        if first_key.as_deref().is_none_or(|k| key < k) {
+            first_key = Some(key.to_owned());
+        }
+        if last_key.as_deref().is_none_or(|k| key > k) {
+            last_key = Some(key.to_owned());
+        }
+    }
+
+    // An empty hit set omits firstKey/lastKey entirely.
+    Json(StatsResponse {
+        name,
+        count,
+        first_key,
+        last_key,
+    })
+    .into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -1271,6 +1456,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             "/datasets/{name}/records",
             get(list_records).put(put_records),
         )
+        .route("/datasets/{name}/stats", get(dataset_stats))
         .with_state(state);
 
     println!("Listening on http://{}", listener.local_addr()?);
@@ -1385,6 +1571,50 @@ mod tests {
         ];
         for case in bad {
             assert!(parse_list_query(case).is_err(), "should reject {case:?}");
+        }
+    }
+
+    #[test]
+    fn stats_query_accepts() {
+        // No parameters aggregates the whole dataset.
+        assert_eq!(parse_stats_query("").unwrap(), KeyFilter::default());
+
+        let f = parse_stats_query("prefix=user-").unwrap();
+        assert_eq!(f.prefix.as_deref(), Some("user-"));
+        assert!(f.lower.is_none() && f.upper.is_none());
+
+        let f = parse_stats_query("gte=a&lt=z").unwrap();
+        assert_eq!(f.lower, Some(("a".to_owned(), true)));
+        assert_eq!(f.upper, Some(("z".to_owned(), false)));
+
+        // Either bound alone is a valid half-open range.
+        let f = parse_stats_query("gt=a").unwrap();
+        assert_eq!(f.lower, Some(("a".to_owned(), false)));
+        assert!(f.upper.is_none());
+    }
+
+    #[test]
+    fn stats_query_rejects() {
+        let bad = [
+            // Pagination and any undocumented parameter are unknown here.
+            "limit=10",
+            "cursor=Abc_-9",
+            "unknown=1",
+            // prefix vs range, duplicate bounds, empty/illegal values.
+            "prefix=p&gte=a",
+            "gte=a&gt=b",
+            "lte=a&lt=b",
+            "prefix=",
+            "gte=",
+            "prefix=a&prefix=b",
+            "gte=a&gte=b",
+            "prefix=a%2Fb",
+            // A pair with no '=' or a bad percent-escape cannot be parsed.
+            "gte",
+            "gte=%zz",
+        ];
+        for case in bad {
+            assert!(parse_stats_query(case).is_err(), "should reject {case:?}");
         }
     }
 }

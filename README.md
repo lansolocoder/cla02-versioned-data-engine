@@ -16,6 +16,7 @@ VDE_BIND=127.0.0.1:8080 cargo run --locked
 | `GET /health` | `{"status":"ok"}` |
 | `GET /version` | `{"name":"versioned-data-engine","version":"0.1.0"}` |
 | `GET /datasets/{name}/records` | 200 `{"name":<数据集名>,"records":[{"key":<key>,"value":<JSON 值>,"updatedAt":<RFC3339 UTC>},...]}`，records 按 key 的 Unicode 码点升序；支持按键前缀或键区间筛选（见下文「记录筛选」）与 `limit`/`cursor` 分页（见下文「分页」）；400 `{"error":"invalid_identifier"}` / `{"error":"invalid_query"}`，404 `{"error":"not_found"}`，500 `{"error":"internal"}` |
+| `GET /datasets/{name}/stats` | 按键范围聚合统计（见下文「按键范围统计」）：200 `{"name":<数据集名>,"count":<命中记录数>,"firstKey":<最小命中 key>,"lastKey":<最大命中 key>}`，无命中时为 200 `{"name":<数据集名>,"count":0}`；筛选参数同记录筛选（`prefix`/`gte`/`gt`/`lte`/`lt`，不带分页参数）；400 `{"error":"invalid_identifier"}` / `{"error":"invalid_query"}`，404 `{"error":"not_found"}`，500 `{"error":"internal"}` |
 | `PUT /datasets/{name}/records` | 批量写入记录，见下文「批量写入」；200 `{"name":<数据集名>,"records":[{"key":<key>,"value":<JSON 值>,"updatedAt":<RFC3339 UTC>},...]}`（records 按 key 的 Unicode 码点升序）；400 `{"error":"invalid_identifier"}` / `{"error":"invalid_json"}`，500 `{"error":"internal"}` |
 
 ### 记录筛选
@@ -65,6 +66,33 @@ VDE_BIND=127.0.0.1:8080 cargo run --locked
 curl 'http://127.0.0.1:8080/datasets/ds1/records?prefix=user-&limit=100'
 # 响应含 "nextCursor":"<token>" 时：
 curl 'http://127.0.0.1:8080/datasets/ds1/records?prefix=user-&limit=100&cursor=<token>'
+```
+
+### 按键范围统计
+
+`GET /datasets/{name}/stats` 返回某个 key 前缀或区间命中的记录条数及 key 边界，无需翻页或拉取完整列表。
+
+- `name` 沿用既有标识符规则：非空且只含 `[A-Za-z0-9_-]`；不合法返回 400 `{"error":"invalid_identifier"}`。
+- 筛选参数与取值规则同「记录筛选」：可选 `prefix` 或 `gte`/`gt`/`lte`/`lt`，取值非空且只含 `[A-Za-z0-9_-]`（需百分号编码）；`prefix` 与区间互斥，下界至多一个、上界至多一个，下界与上界可同时使用构成区间。不带任何筛选参数时统计整个数据集。
+- 统计接口只接受上述五个筛选参数：`limit`、`cursor` 等任何未文档化参数、任一参数重复、空取值或无法解析的取值，一律返回 400 `{"error":"invalid_query"}`。
+- 成功返回 200：`{"name":<数据集名>,"count":<命中记录数>,"firstKey":<最小命中 key>,"lastKey":<最大命中 key>}`。比较与排序均为 key 的 Unicode 码点序，`count` 为满足筛选的**完整**命中条数，与分页无关。
+- 筛选无命中时返回 200 `{"name":<数据集名>,"count":0}`，不含 `firstKey`/`lastKey`，也不返回 404。
+- 统计结果与同一筛选下记录列表的完整命中集一致：逐条计数的总数与 `count` 相同，列表（跨页汇总后）的首、尾 key 与 `firstKey`/`lastKey` 相同。
+- 数据集目录不存在返回 404 `{"error":"not_found"}`；命中范围内存在损坏或不可读的记录时整个请求返回 500 `{"error":"internal"}`，不返回部分统计，命中范围外的损坏记录不影响本请求。
+- 统计只反映已成功返回的写入结果，与列表、单条读取看到的状态一致；并发写入时只能看到写入前或写入后的完整数据集，不会观察到半成品状态。
+- 统计仅依据目录项与文件元数据聚合，**不逐条读取记录 value**，单次请求开销不与命中记录 value 的总字节数成正比。
+
+示例：
+
+```sh
+curl http://127.0.0.1:8080/datasets/ds1/stats
+# {"name":"ds1","count":1287,"firstKey":"user-0000","lastKey":"user-1286"}
+curl 'http://127.0.0.1:8080/datasets/ds1/stats?prefix=user-1'
+# {"name":"ds1","count":287,"firstKey":"user-1000","lastKey":"user-1286"}
+curl 'http://127.0.0.1:8080/datasets/ds1/stats?gte=user-0000&lt=user-0100'
+# {"name":"ds1","count":100,"firstKey":"user-0000","lastKey":"user-0099"}
+curl 'http://127.0.0.1:8080/datasets/ds1/stats?prefix=zzz'
+# {"name":"ds1","count":0}
 ```
 
 ### 批量写入
